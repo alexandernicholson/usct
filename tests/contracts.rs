@@ -1,7 +1,7 @@
 use std::{fs, io::Write, process::Command};
 use tempfile::tempdir;
 use usct::{
-    app,
+    app, cache,
     catalog::ModelsDevCatalog,
     domain::{Price, TokenUsage},
     session::{Harness, parse_session, parse_session_in_range, parse_session_incremental},
@@ -288,4 +288,124 @@ fn incremental_parser_defers_partial_trailing_jsonl_records() {
     let (record, _) = parse_session_incremental(Harness::Omp, &path, None, state).unwrap();
     assert_eq!(record.usage.input, 150);
     assert_eq!(record.usage.output, 15);
+}
+
+#[test]
+fn aggregate_cache_reuses_only_unchanged_contributions() {
+    let dir = tempdir().unwrap();
+    let catalog = dir.path().join("models.json");
+    let first = dir.path().join("first.jsonl");
+    let second = dir.path().join("second.jsonl");
+    fs::write(&catalog, "{}").unwrap();
+    fs::write(&first, "first\n").unwrap();
+    fs::write(&second, "second\n").unwrap();
+    let price = Price {
+        input: 2.0,
+        output: 10.0,
+        cache_read: Some(0.2),
+        cache_write: None,
+        reasoning: None,
+    };
+    let usage = TokenUsage {
+        input: 100,
+        output: 10,
+        ..TokenUsage::default()
+    };
+    let first_session = cache::CachedSession::new(
+        cache::SessionData {
+            source: "omp".to_owned(),
+            model: "gpt-test".to_owned(),
+            usage,
+            price,
+            cost_usd: price.cost(usage),
+            progress: None,
+        },
+        &first,
+        &catalog,
+    )
+    .unwrap();
+    let second_session = cache::CachedSession::new(
+        cache::SessionData {
+            source: "omp".to_owned(),
+            model: "gpt-test".to_owned(),
+            usage,
+            price,
+            cost_usd: price.cost(usage),
+            progress: None,
+        },
+        &second,
+        &catalog,
+    )
+    .unwrap();
+    let contributions = vec![
+        (first.clone(), first_session),
+        (second.clone(), second_session),
+    ];
+    let report = cache::CachedReport::new(
+        vec!["omp".to_owned()],
+        2,
+        usage,
+        price.cost(usage) * 2.0,
+        None,
+        &contributions,
+        cache::CacheContext {
+            directory_paths: &[dir.path().to_path_buf()],
+            catalog_path: &catalog,
+        },
+    )
+    .unwrap();
+    cache::save_report(&report, "aggregate-test", &catalog);
+    fs::write(&second, "changed\n").unwrap();
+    assert!(cache::load_report("aggregate-test", &catalog).is_none());
+    let stale = cache::load_stale_report("aggregate-test", &catalog).unwrap();
+    assert!(stale.reusable_contribution(&first).is_some());
+    assert!(stale.reusable_contribution(&second).is_none());
+    let previous = stale.contribution(&second).unwrap();
+    assert_eq!(previous.model, "gpt-test");
+    assert_eq!(previous.price, price);
+}
+
+#[test]
+fn catalog_change_invalidates_resolved_contribution_prices() {
+    let dir = tempdir().unwrap();
+    let catalog = dir.path().join("models.json");
+    let session = dir.path().join("session.jsonl");
+    fs::write(&catalog, "old").unwrap();
+    fs::write(&session, "session\n").unwrap();
+    let price = Price {
+        input: 1.0,
+        output: 2.0,
+        cache_read: None,
+        cache_write: None,
+        reasoning: None,
+    };
+    let cached = cache::CachedSession::new(
+        cache::SessionData {
+            source: "omp".to_owned(),
+            model: "gpt-test".to_owned(),
+            usage: TokenUsage::default(),
+            price,
+            cost_usd: 0.0,
+            progress: None,
+        },
+        &session,
+        &catalog,
+    )
+    .unwrap();
+    let report = cache::CachedReport::new(
+        vec!["omp".to_owned()],
+        1,
+        TokenUsage::default(),
+        0.0,
+        None,
+        &[(session, cached)],
+        cache::CacheContext {
+            directory_paths: &[dir.path().to_path_buf()],
+            catalog_path: &catalog,
+        },
+    )
+    .unwrap();
+    cache::save_report(&report, "catalog-test", &catalog);
+    fs::write(&catalog, "new catalog contents").unwrap();
+    assert!(cache::load_stale_report("catalog-test", &catalog).is_none());
 }

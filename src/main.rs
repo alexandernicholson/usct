@@ -110,36 +110,44 @@ fn run() -> Result<String, String> {
     if let Some(report) = cache::load_report(&scope, &catalog_path) {
         return render_report(&report, &format);
     }
-    let sessions: Vec<(Harness, PathBuf)> = match session {
-        Some(path) => vec![(constrained.unwrap_or_else(|| infer_harness(&path)), path)],
-        None if period == Period::Session => {
-            let found = discovery::latest(constrained)?;
-            vec![(found.harness, found.path)]
-        }
-        None => discovery::all(constrained)?
+    let stale_report = cache::load_stale_report(&scope, &catalog_path);
+    let sessions: Vec<(Harness, PathBuf)> = if let Some(path) = session {
+        vec![(constrained.unwrap_or_else(|| infer_harness(&path)), path)]
+    } else if let Some(cached) = stale_report
+        .as_ref()
+        .and_then(cache::CachedReport::sessions_if_topology_unchanged)
+    {
+        cached
+            .into_iter()
+            .map(|(source, path)| Harness::from_str(&source).map(|harness| (harness, path)))
+            .collect::<Result<_, _>>()?
+    } else if period == Period::Session {
+        let found = discovery::latest(constrained)?;
+        vec![(found.harness, found.path)]
+    } else {
+        discovery::all(constrained)?
             .into_iter()
             .map(|found| (found.harness, found.path))
-            .collect(),
+            .collect()
     };
     let session_paths: Vec<_> = sessions.iter().map(|(_, path)| path.clone()).collect();
     let directory_paths = watch_directories(constrained, &session_paths);
-    let catalog = ModelsDevCatalog::from_path(&catalog_path)
-        .map_err(|error| format!("{error}; run 'usct update'"))?;
     let calculated = calculate_sessions(
         &sessions,
-        &catalog,
         &catalog_path,
         &range_key,
         range.as_ref(),
+        stale_report.as_ref(),
     )?;
+    let aggregate = calculated.aggregate;
     let report = cache::CachedReport::new(
-        calculated.sources,
-        calculated.session_count,
-        calculated.usage,
-        calculated.cost,
+        aggregate.sources,
+        aggregate.session_count,
+        aggregate.usage,
+        aggregate.cost,
         range.clone(),
+        &calculated.contributions,
         cache::CacheContext {
-            session_paths: &session_paths,
             directory_paths: &directory_paths,
             catalog_path: &catalog_path,
         },
@@ -148,59 +156,91 @@ fn run() -> Result<String, String> {
     render_report(&report, &format)
 }
 
+struct CalculatedSessions {
+    aggregate: app::AggregateReport,
+    contributions: Vec<(PathBuf, cache::CachedSession)>,
+}
+
 fn calculate_sessions(
     sessions: &[(Harness, PathBuf)],
-    catalog: &ModelsDevCatalog,
     catalog_path: &Path,
     range_key: &str,
     range: Option<&TimeRange>,
-) -> Result<app::AggregateReport, String> {
+    stale_report: Option<&cache::CachedReport>,
+) -> Result<CalculatedSessions, String> {
+    let mut catalog = None;
     let mut sources = Vec::new();
     let mut usage = usct::domain::TokenUsage::default();
     let mut cost = 0.0;
-    let mut session_count = 0;
+    let mut contributions = Vec::with_capacity(sessions.len());
     for (harness, path) in sessions {
-        let session = if let Some(cached) = cache::load_session(path, range_key, catalog_path) {
+        let prior = stale_report.and_then(|report| report.contribution(path));
+        let session = if let Some(cached) =
+            stale_report.and_then(|report| report.reusable_contribution(path))
+        {
             cached
         } else {
-            let progress = cache::load_progress(path, range_key, catalog_path);
+            let progress = prior
+                .as_ref()
+                .and_then(|prior| prior.progress.clone())
+                .or_else(|| cache::load_progress(path, range_key, catalog_path));
             let (record, progress) =
                 match parse_session_incremental(*harness, path, range, progress) {
                     Ok(result) => result,
                     Err(error) if error == "session contains no token usage" => continue,
                     Err(error) => return Err(format!("{}: {error}", path.display())),
                 };
-            let report = app::price_record(*harness, path, catalog, record)
-                .map_err(|error| format!("{}: {error}", path.display()))?;
-            let cached = cache::CachedSession::new(
-                harness.name().to_owned(),
-                report.record.usage,
-                report.cost,
+            let (price, calculated_cost) =
+                if let Some(prior) = prior.as_ref().filter(|prior| prior.model == record.model) {
+                    (prior.price, prior.price.cost(record.usage))
+                } else {
+                    if catalog.is_none() {
+                        catalog = Some(
+                            ModelsDevCatalog::from_path(catalog_path)
+                                .map_err(|error| format!("{error}; run 'usct update'"))?,
+                        );
+                    }
+                    let report = app::price_record(
+                        *harness,
+                        path,
+                        catalog.as_ref().expect("catalog initialized"),
+                        record.clone(),
+                    )
+                    .map_err(|error| format!("{}: {error}", path.display()))?;
+                    (report.price, report.cost)
+                };
+            cache::CachedSession::new(
+                cache::SessionData {
+                    source: harness.name().to_owned(),
+                    model: record.model,
+                    usage: record.usage,
+                    price,
+                    cost_usd: calculated_cost,
+                    progress,
+                },
                 path,
                 catalog_path,
-            )?;
-            if let Some(progress) = progress.as_ref() {
-                cache::save_progress(progress, path, range_key, catalog_path);
-            }
-            cache::save_session(&cached, path, range_key, catalog_path);
-            cached
+            )?
         };
         if !sources.contains(&session.source) {
             sources.push(session.source.clone());
         }
         usage.add_assign(session.usage);
         cost += session.cost_usd;
-        session_count += 1;
+        contributions.push((path.clone(), session));
     }
-    if session_count == 0 {
+    if contributions.is_empty() {
         return Err("sessions contain no token usage".to_owned());
     }
     sources.sort();
-    Ok(app::AggregateReport {
-        sources,
-        session_count,
-        usage,
-        cost,
+    Ok(CalculatedSessions {
+        aggregate: app::AggregateReport {
+            sources,
+            session_count: contributions.len(),
+            usage,
+            cost,
+        },
+        contributions,
     })
 }
 

@@ -1,4 +1,8 @@
-use crate::{domain::TokenUsage, session::ParserProgress, time_range::TimeRange};
+use crate::{
+    domain::{Price, TokenUsage},
+    session::ParserProgress,
+    time_range::TimeRange,
+};
 use serde::{Deserialize, Serialize};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::UNIX_EPOCH;
@@ -11,18 +15,21 @@ use std::{
 
 pub const MODELS_URL: &str = "https://models.dev/api.json";
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct FileFingerprint {
     path: String,
     len: u64,
     mtime_ns: u128,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedSession {
     pub source: String,
+    pub model: String,
     pub usage: TokenUsage,
+    pub price: Price,
     pub cost_usd: f64,
+    pub progress: Option<ParserProgress>,
     version: u8,
     file: FileFingerprint,
     catalog: FileFingerprint,
@@ -44,7 +51,7 @@ pub fn load_session(path: &Path, range_key: &str, catalog_path: &Path) -> Option
     let cache_path = session_state_path(catalog_path, path, range_key)?;
     let bytes = fs::read(cache_path).ok()?;
     let session: CachedSession = serde_json::from_slice(&bytes).ok()?;
-    (session.version == 2
+    (session.version == 4
         && session.file == fingerprint(path).ok()?
         && session.catalog == fingerprint(catalog_path).ok()?)
     .then_some(session)
@@ -57,23 +64,41 @@ pub fn save_session(session: &CachedSession, path: &Path, range_key: &str, catal
     write_atomic(&cache_path, session);
 }
 
+pub struct SessionData {
+    pub source: String,
+    pub model: String,
+    pub usage: TokenUsage,
+    pub price: Price,
+    pub cost_usd: f64,
+    pub progress: Option<ParserProgress>,
+}
+
 impl CachedSession {
-    pub fn new(
-        source: String,
-        usage: TokenUsage,
-        cost_usd: f64,
-        path: &Path,
-        catalog_path: &Path,
-    ) -> Result<Self, String> {
+    pub fn new(data: SessionData, path: &Path, catalog_path: &Path) -> Result<Self, String> {
         Ok(Self {
-            source,
-            usage,
-            cost_usd,
-            version: 2,
+            source: data.source,
+            model: data.model,
+            usage: data.usage,
+            price: data.price,
+            cost_usd: data.cost_usd,
+            progress: data.progress,
+            version: 4,
             file: fingerprint(path)?,
             catalog: fingerprint(catalog_path)?,
         })
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedContribution {
+    path: String,
+    file: FileFingerprint,
+    source: String,
+    model: String,
+    usage: TokenUsage,
+    price: Price,
+    cost_usd: f64,
+    progress: Option<ParserProgress>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -87,10 +112,10 @@ pub struct CachedReport {
     files: Vec<FileFingerprint>,
     directories: Vec<FileFingerprint>,
     catalog: FileFingerprint,
+    contributions: Vec<CachedContribution>,
 }
 
 pub struct CacheContext<'a> {
-    pub session_paths: &'a [PathBuf],
     pub directory_paths: &'a [PathBuf],
     pub catalog_path: &'a Path,
 }
@@ -102,6 +127,7 @@ impl CachedReport {
         usage: TokenUsage,
         cost_usd: f64,
         range: Option<TimeRange>,
+        contributions: &[(PathBuf, CachedSession)],
         context: CacheContext<'_>,
     ) -> Result<Self, String> {
         Ok(Self {
@@ -110,10 +136,63 @@ impl CachedReport {
             usage,
             cost_usd,
             range,
-            version: 6,
-            files: fingerprints(context.session_paths)?,
+            version: 8,
+            files: contributions
+                .iter()
+                .map(|(_, session)| session.file.clone())
+                .collect(),
             directories: fingerprints(context.directory_paths)?,
             catalog: fingerprint(context.catalog_path)?,
+            contributions: contributions
+                .iter()
+                .map(|(path, session)| CachedContribution {
+                    path: path.display().to_string(),
+                    file: session.file.clone(),
+                    source: session.source.clone(),
+                    model: session.model.clone(),
+                    usage: session.usage,
+                    price: session.price,
+                    cost_usd: session.cost_usd,
+                    progress: session.progress.clone(),
+                })
+                .collect(),
+        })
+    }
+
+    pub fn contribution(&self, path: &Path) -> Option<CachedSession> {
+        let contribution = self
+            .contributions
+            .iter()
+            .find(|contribution| contribution.path == path.display().to_string())?;
+        Some(CachedSession {
+            source: contribution.source.clone(),
+            model: contribution.model.clone(),
+            usage: contribution.usage,
+            price: contribution.price,
+            cost_usd: contribution.cost_usd,
+            progress: contribution.progress.clone(),
+            version: 4,
+            file: contribution.file.clone(),
+            catalog: self.catalog.clone(),
+        })
+    }
+
+    pub fn reusable_contribution(&self, path: &Path) -> Option<CachedSession> {
+        let session = self.contribution(path)?;
+        (session.file == fingerprint(path).ok()?).then_some(session)
+    }
+
+    pub fn sessions_if_topology_unchanged(&self) -> Option<Vec<(String, PathBuf)>> {
+        (self.directories == refresh(&self.directories).ok()?).then(|| {
+            self.contributions
+                .iter()
+                .map(|contribution| {
+                    (
+                        contribution.source.clone(),
+                        PathBuf::from(&contribution.path),
+                    )
+                })
+                .collect()
         })
     }
 }
@@ -122,11 +201,17 @@ pub fn load_report(scope: &str, catalog_path: &Path) -> Option<CachedReport> {
     let path = state_path(catalog_path, scope)?;
     let bytes = fs::read(path).ok()?;
     let report: CachedReport = serde_json::from_slice(&bytes).ok()?;
-    (report.version == 6
+    (report.version == 8
         && report.files == refresh(&report.files).ok()?
         && report.directories == refresh(&report.directories).ok()?
         && report.catalog == fingerprint(catalog_path).ok()?)
     .then_some(report)
+}
+
+pub fn load_stale_report(scope: &str, catalog_path: &Path) -> Option<CachedReport> {
+    let path = state_path(catalog_path, scope)?;
+    let report: CachedReport = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    (report.version == 8 && report.catalog == fingerprint(catalog_path).ok()?).then_some(report)
 }
 
 pub fn save_report(report: &CachedReport, scope: &str, catalog_path: &Path) {

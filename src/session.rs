@@ -139,8 +139,9 @@ pub fn parse_session_incremental(
     reader
         .seek(SeekFrom::Start(state.offset))
         .map_err(|error| format!("cannot seek {}: {error}", path.display()))?;
+    let mut bytes = Vec::with_capacity(4096);
     loop {
-        let mut bytes = Vec::new();
+        bytes.clear();
         let read = reader
             .read_until(b'\n', &mut bytes)
             .map_err(|error| format!("cannot read {}: {error}", path.display()))?;

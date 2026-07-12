@@ -33,7 +33,7 @@ impl TokenUsage {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Price {
     pub input: f64,
     pub output: f64,

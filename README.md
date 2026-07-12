@@ -369,6 +369,8 @@ This lets USCT bypass recursive discovery on an unchanged warm run while still i
 
 When one transcript changes, unchanged transcripts are reused from their per-session caches.
 
+Aggregate states retain every session's normalized contribution, resolved model price, fingerprint, and parser progress. When one session changes, USCT subtracts its prior contribution and adds the updated contribution; unchanged sessions are reused directly from the aggregate state. Ordinary appends therefore avoid recursive discovery, per-session cache reads, and models.dev JSON decoding.
+
 For append-only JSONL transcripts, USCT also persists source-specific parser progress:
 
 - the byte offset of the last complete JSONL record;
@@ -414,6 +416,21 @@ Measured by copying a 4,407,235-byte active OMP transcript, performing one full 
 | Maximum | — | 11.801 ms |
 
 The one-time seed establishes persistent parser progress. Subsequent active-session refreshes process only appended records instead of reparsing the 4.4 MB history.
+
+### Live all-provider append
+
+The active tmux command aggregates 25 local sessions across Claude, Codex, and OMP. Its changed-session path improved as follows:
+
+| Implementation | Changed refresh |
+|---|---:|
+| Whole active-transcript reparse | approximately 350–380 ms |
+| Incremental transcript with full aggregate reconstruction | 50.794 ms |
+| Incremental per-session contributions | 14.145 ms |
+| Contribution deltas, embedded progress, and topology reuse | **3.835 ms** |
+
+The final unchanged warm path measured 2.833 ms median and 3.142 ms p95. A changed active-session refresh is therefore now close to the normal process-launch-dominated warm path.
+
+The daily all-provider state measured 8,635 bytes and is updated with one atomic cache write. Earlier implementations wrote separate parser-progress, per-session, and aggregate files on an active append.
 
 ### Process-launch floor
 
