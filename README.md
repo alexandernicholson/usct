@@ -416,20 +416,27 @@ Each of 50 runs used a new temporary catalog path and session path, forcing cata
 |---:|---:|---:|---:|---:|
 | 50 | 5.086 ms | 7.184 ms | 4.617 ms | 12.314 ms |
 
-### Active-transcript rebuild and append
+### Forced full rebuilds
 
-The controlled source was a 7,786,869-byte OMP transcript containing 1,605 JSONL records. Every full-rebuild run copied it to a new temporary path. Every append run first seeded parser progress and then appended one complete usage record.
+Each benchmark uses a frozen copy of the largest local transcript available for that provider. Every invocation receives a new temporary transcript and catalog path, forcing transcript parsing, models.dev decoding, pricing, and an atomic cache write.
 
-| Scenario | Runs | Median | p95 | Minimum | Maximum |
-|---|---:|---:|---:|---:|---:|
-| Full rebuild before typed decoding | 15 | 15.254 ms | 15.513 ms | 14.717 ms | 15.556 ms |
-| **Full rebuild with borrowed OMP envelopes** | 100 | **9.995 ms** | **10.778 ms** | 9.371 ms | 10.978 ms |
-| Incremental append before typed decoding | 30 | 4.027 ms | 4.465 ms | 3.649 ms | 4.752 ms |
-| **Incremental append with borrowed OMP envelopes** | 100 | **3.699 ms** | **4.163 ms** | 3.218 ms | 10.732 ms |
+| Provider | Bytes | Records | Runs | Median | p95 | Minimum | Maximum |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| OMP | 7,786,869 | 1,605 | 100 | **9.995 ms** | 10.778 ms | 9.371 ms | 10.978 ms |
+| Claude Code | 7,077,632 | 2,667 | 100 | **9.619 ms** | 10.044 ms | 9.364 ms | 10.847 ms |
+| Codex CLI | 599,348 | 168 | 100 | **5.333 ms** | 5.627 ms | 5.024 ms | 6.108 ms |
 
-Typed decoding reduced the full-rebuild median by approximately 34.5%. It borrows the accounting fields needed by OMP and asks Serde to skip `content`, tool arguments, tool results, generated text, and unrelated metadata instead of constructing a recursive `serde_json::Value` tree for each record.
+Borrowed provider envelopes extract only accounting fields and ask Serde to skip `content`, tool arguments, tool results, generated text, and unrelated metadata instead of constructing a recursive `serde_json::Value` tree for every known record.
 
-OMP records with known layouts use the typed path. Unknown record types containing usage fields fall back to recursive `Value` traversal, preserving compatibility with future or plugin-provided schemas. Nested `message.details.response.usage` records remain billable and are covered by a parser-equivalence contract.
+Claude preserves exact message-ID deduplication. Codex preserves cumulative token snapshots, pre-range baselines, cached-input normalization, and reasoning-token separation. OMP preserves nested `message.details.response.usage` accounting. Unknown record types containing usage fields fall back to recursive `Value` traversal for schema compatibility.
+
+### Incremental OMP append
+
+The controlled append benchmark first seeds the 7,786,869-byte OMP transcript, then appends one complete usage record per isolated run.
+
+| Runs | Median | p95 | Minimum | Maximum |
+|---:|---:|---:|---:|---:|
+| 100 | **3.699 ms** | 4.163 ms | 3.218 ms | 10.732 ms |
 
 The one-time full rebuild is required after installation, cache-schema changes, replacement, or truncation. Normal append-only updates seek to the stored byte offset and decode only newly completed records. Plain JSON and SQLite sources retain their safe full-parser fallback.
 

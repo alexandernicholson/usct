@@ -234,6 +234,42 @@ fn incremental_omp_parser_reads_only_appended_records() {
 }
 
 #[test]
+fn incremental_claude_parser_deduplicates_borrowed_messages() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("session.jsonl");
+    fs::write(
+        &path,
+        concat!(
+            "{\"type\":\"assistant\",\"message\":{\"id\":\"a\",\"model\":\"claude-test\",\"content\":\"ignored\",\"usage\":{\"input_tokens\":100,\"output_tokens\":10}}}\n",
+            "{\"type\":\"assistant\",\"message\":{\"id\":\"a\",\"model\":\"claude-test\",\"content\":\"ignored again\",\"usage\":{\"input_tokens\":100,\"output_tokens\":10}}}\n",
+            "{\"type\":\"assistant\",\"message\":{\"id\":\"b\",\"model\":\"claude-test\",\"usage\":{\"input_tokens\":50,\"output_tokens\":5}}}\n"
+        ),
+    )
+    .unwrap();
+    let (record, _) = parse_session_incremental(Harness::Claude, &path, None, None).unwrap();
+    assert_eq!(record.usage.input, 150);
+    assert_eq!(record.usage.output, 15);
+}
+
+#[test]
+fn unknown_codex_records_retain_cumulative_schema_fallback() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("rollout.jsonl");
+    fs::write(
+        &path,
+        concat!(
+            "{\"timestamp\":\"2026-07-12T00:00:00Z\",\"type\":\"future_context\",\"payload\":{\"model\":\"gpt-test\"}}\n",
+            "{\"timestamp\":\"2026-07-12T00:01:00Z\",\"type\":\"future_event\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":100,\"cached_input_tokens\":20,\"output_tokens\":10}}}}\n"
+        ),
+    )
+    .unwrap();
+    let (record, _) = parse_session_incremental(Harness::Codex, &path, None, None).unwrap();
+    assert_eq!(record.usage.input, 80);
+    assert_eq!(record.usage.cache_read, 20);
+    assert_eq!(record.usage.output, 10);
+}
+
+#[test]
 fn incremental_parser_rebuilds_after_in_place_replacement() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("session.jsonl");

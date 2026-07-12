@@ -206,6 +206,29 @@ impl JsonUsage {
     }
 }
 
+#[derive(Deserialize)]
+struct CodexEnvelope<'a> {
+    #[serde(rename = "type")]
+    kind: Option<&'a str>,
+    timestamp: Option<JsonTimestamp<'a>>,
+    #[serde(borrow)]
+    payload: Option<CodexPayload<'a>>,
+}
+
+#[derive(Deserialize)]
+struct CodexPayload<'a> {
+    #[serde(rename = "type")]
+    kind: Option<&'a str>,
+    #[serde(alias = "model_id", alias = "modelID")]
+    model: Option<&'a str>,
+    info: Option<CodexInfo>,
+}
+
+#[derive(Deserialize)]
+struct CodexInfo {
+    total_token_usage: Option<JsonUsage>,
+}
+
 pub fn parse_session_incremental(
     harness: Harness,
     path: &Path,
@@ -292,9 +315,102 @@ fn process_typed_jsonl(
     range: Option<&TimeRange>,
     state: &mut ParserProgress,
 ) -> bool {
-    if harness != Harness::Omp {
-        return false;
+    match harness {
+        Harness::Claude => process_typed_claude(line, range, state),
+        Harness::Codex => process_typed_codex(line, range, state),
+        Harness::Omp => process_typed_omp(line, range, state),
+        _ => false,
     }
+}
+
+fn process_typed_claude(
+    line: &[u8],
+    range: Option<&TimeRange>,
+    state: &mut ParserProgress,
+) -> bool {
+    let Ok(envelope) = serde_json::from_slice::<JsonlEnvelope<'_>>(line) else {
+        return false;
+    };
+    let known_shape = matches!(
+        envelope.kind,
+        Some(
+            "mode"
+                | "permission-mode"
+                | "file-history-snapshot"
+                | "user"
+                | "system"
+                | "attachment"
+                | "ai-title"
+                | "assistant"
+                | "last-prompt"
+                | "queue-operation"
+        )
+    );
+    let Some(message) = envelope.message else {
+        return known_shape || !contains_usage_key(line);
+    };
+    if let Some(model) = message.model {
+        state.model = Some(model.to_owned());
+    }
+    let Some(usage) = message.usage else {
+        return known_shape || !contains_usage_key(line);
+    };
+    let timestamp = envelope
+        .timestamp
+        .as_ref()
+        .or(message.timestamp.as_ref())
+        .and_then(JsonTimestamp::milliseconds);
+    if range.is_some_and(|range| timestamp.is_none_or(|time| !range.contains(time))) {
+        return true;
+    }
+    let should_count = message
+        .id
+        .is_none_or(|identity| state.seen_ids.insert(identity.to_owned()));
+    if should_count {
+        state.usage.add_assign(usage.normalized(false));
+    }
+    true
+}
+
+fn process_typed_codex(line: &[u8], range: Option<&TimeRange>, state: &mut ParserProgress) -> bool {
+    let Ok(envelope) = serde_json::from_slice::<CodexEnvelope<'_>>(line) else {
+        return false;
+    };
+    let known_shape = matches!(
+        envelope.kind,
+        Some("session_meta" | "event_msg" | "response_item" | "world_state" | "turn_context")
+    );
+    let Some(payload) = envelope.payload else {
+        return known_shape || !contains_usage_key(line);
+    };
+    if let Some(model) = payload.model {
+        state.model = Some(model.to_owned());
+    }
+    if payload.kind != Some("token_count") {
+        return known_shape || !contains_usage_key(line);
+    }
+    let Some(snapshot) = payload
+        .info
+        .and_then(|info| info.total_token_usage)
+        .map(|usage| usage.normalized(true))
+    else {
+        return !contains_usage_key(line);
+    };
+    let timestamp = envelope
+        .timestamp
+        .as_ref()
+        .and_then(JsonTimestamp::milliseconds);
+    if let Some(range) = range
+        && timestamp.is_some_and(|time| time < range.start_ms)
+    {
+        state.codex_baseline = snapshot;
+    } else if range.is_none_or(|range| timestamp.is_some_and(|time| range.contains(time))) {
+        state.usage = snapshot.saturating_sub(state.codex_baseline);
+    }
+    true
+}
+
+fn process_typed_omp(line: &[u8], range: Option<&TimeRange>, state: &mut ParserProgress) -> bool {
     let Ok(envelope) = serde_json::from_slice::<JsonlEnvelope<'_>>(line) else {
         return false;
     };
@@ -313,10 +429,6 @@ fn process_typed_jsonl(
                 | "custom"
                 | "custom_message"
                 | "compaction"
-                | "assistant"
-                | "user"
-                | "system"
-                | "progress"
         )
     );
     let Some(message) = envelope.message else {
@@ -358,6 +470,7 @@ fn contains_usage_key(line: &[u8]) -> bool {
         b"\"usage\":".as_slice(),
         b"\"usageMetadata\":",
         b"\"tokenUsage\":",
+        b"\"total_token_usage\":",
     ]
     .into_iter()
     .any(|needle| line.windows(needle.len()).any(|window| window == needle))
