@@ -93,6 +93,119 @@ pub struct ParserProgress {
     range_end_ms: Option<i64>,
 }
 
+#[derive(Deserialize)]
+struct JsonlEnvelope<'a> {
+    #[serde(rename = "type")]
+    kind: Option<&'a str>,
+    #[serde(borrow)]
+    message: Option<JsonlMessage<'a>>,
+    #[serde(alias = "model_id", alias = "modelID")]
+    model: Option<&'a str>,
+    #[serde(alias = "created_at", alias = "createdAt", alias = "time")]
+    timestamp: Option<JsonTimestamp<'a>>,
+}
+
+#[derive(Deserialize)]
+struct JsonlMessage<'a> {
+    id: Option<&'a str>,
+    #[serde(alias = "model_id", alias = "modelID")]
+    model: Option<&'a str>,
+    #[serde(borrow)]
+    details: Option<JsonlDetails<'a>>,
+    usage: Option<JsonUsage>,
+    #[serde(alias = "created_at", alias = "createdAt", alias = "time")]
+    timestamp: Option<JsonTimestamp<'a>>,
+}
+
+#[derive(Deserialize)]
+struct JsonlDetails<'a> {
+    #[serde(borrow)]
+    response: Option<JsonlResponse<'a>>,
+}
+
+#[derive(Deserialize)]
+struct JsonlResponse<'a> {
+    model: Option<&'a str>,
+    usage: Option<JsonUsage>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum JsonTimestamp<'a> {
+    Text(&'a str),
+    Signed(i64),
+    Unsigned(u64),
+}
+
+impl JsonTimestamp<'_> {
+    fn milliseconds(&self) -> Option<i64> {
+        match self {
+            Self::Text(value) => parse_timestamp(value),
+            Self::Signed(value) => Some(timestamp_number(*value)),
+            Self::Unsigned(value) => i64::try_from(*value).ok().map(timestamp_number),
+        }
+    }
+}
+
+#[derive(Default, Deserialize)]
+struct JsonUsage {
+    #[serde(
+        default,
+        alias = "input_tokens",
+        alias = "inputTokens",
+        alias = "prompt_tokens",
+        alias = "promptTokenCount"
+    )]
+    input: u64,
+    #[serde(
+        default,
+        alias = "output_tokens",
+        alias = "outputTokens",
+        alias = "completion_tokens",
+        alias = "candidatesTokenCount"
+    )]
+    output: u64,
+    #[serde(
+        default,
+        rename = "cacheRead",
+        alias = "cache_read_input_tokens",
+        alias = "cached_input_tokens",
+        alias = "cacheReadInputTokens",
+        alias = "cachedContentTokenCount"
+    )]
+    cache_read: u64,
+    #[serde(
+        default,
+        rename = "cacheWrite",
+        alias = "cache_creation_input_tokens",
+        alias = "cache_write_input_tokens",
+        alias = "cacheWriteInputTokens"
+    )]
+    cache_write: u64,
+    #[serde(
+        default,
+        alias = "reasoning_output_tokens",
+        alias = "thoughtsTokenCount"
+    )]
+    reasoning_tokens: u64,
+}
+
+impl JsonUsage {
+    fn normalized(&self, cached_is_subset: bool) -> TokenUsage {
+        TokenUsage {
+            input: if cached_is_subset {
+                self.input.saturating_sub(self.cache_read)
+            } else {
+                self.input
+            },
+            output: self.output.saturating_sub(self.reasoning_tokens),
+            cache_read: self.cache_read,
+            cache_write: self.cache_write,
+            reasoning: self.reasoning_tokens,
+        }
+    }
+}
+
 pub fn parse_session_incremental(
     harness: Harness,
     path: &Path,
@@ -157,18 +270,97 @@ pub fn parse_session_incremental(
         if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        let value: Value = serde_json::from_slice(line).map_err(|error| {
-            format!(
-                "invalid JSON near byte {} in {}: {error}",
-                state.offset,
-                path.display()
-            )
-        })?;
-        process_incremental_value(harness, &value, range, &mut state);
+        if !process_typed_jsonl(harness, line, range, &mut state) {
+            let value: Value = serde_json::from_slice(line).map_err(|error| {
+                format!(
+                    "invalid JSON near byte {} in {}: {error}",
+                    state.offset,
+                    path.display()
+                )
+            })?;
+            process_incremental_value(harness, &value, range, &mut state);
+        }
     }
     state.tail_hash = tail_hash(path, state.offset).unwrap_or(0);
     let record = finish(state.model.clone(), state.usage)?;
     Ok((record, Some(state)))
+}
+
+fn process_typed_jsonl(
+    harness: Harness,
+    line: &[u8],
+    range: Option<&TimeRange>,
+    state: &mut ParserProgress,
+) -> bool {
+    if harness != Harness::Omp {
+        return false;
+    }
+    let Ok(envelope) = serde_json::from_slice::<JsonlEnvelope<'_>>(line) else {
+        return false;
+    };
+    if let Some(model) = envelope.model {
+        state.model = Some(model.to_owned());
+    }
+    let known_shape = matches!(
+        envelope.kind,
+        Some(
+            "title"
+                | "session"
+                | "model_change"
+                | "thinking_level_change"
+                | "message"
+                | "title_change"
+                | "custom"
+                | "custom_message"
+                | "compaction"
+                | "assistant"
+                | "user"
+                | "system"
+                | "progress"
+        )
+    );
+    let Some(message) = envelope.message else {
+        return known_shape || !contains_usage_key(line);
+    };
+    if let Some(model) = message.model {
+        state.model = Some(model.to_owned());
+    }
+    let timestamp = envelope
+        .timestamp
+        .as_ref()
+        .or(message.timestamp.as_ref())
+        .and_then(JsonTimestamp::milliseconds);
+    let identity = message.id;
+    let usage = if let Some(usage) = message.usage {
+        usage
+    } else if let Some(response) = message.details.and_then(|details| details.response)
+        && let Some(usage) = response.usage
+    {
+        if let Some(model) = response.model {
+            state.model = Some(model.to_owned());
+        }
+        usage
+    } else {
+        return known_shape || !contains_usage_key(line);
+    };
+    if range.is_some_and(|range| timestamp.is_none_or(|time| !range.contains(time))) {
+        return true;
+    }
+    let should_count = identity.is_none_or(|identity| state.seen_ids.insert(identity.to_owned()));
+    if should_count {
+        state.usage.add_assign(usage.normalized(false));
+    }
+    true
+}
+
+fn contains_usage_key(line: &[u8]) -> bool {
+    [
+        b"\"usage\":".as_slice(),
+        b"\"usageMetadata\":",
+        b"\"tokenUsage\":",
+    ]
+    .into_iter()
+    .any(|needle| line.windows(needle.len()).any(|window| window == needle))
 }
 
 fn process_incremental_value(
@@ -520,16 +712,19 @@ fn timestamp_ms(value: &Value) -> Option<i64> {
         .into_iter()
         .find_map(|key| {
             let value = object.get(key)?;
-            value.as_str().and_then(parse_timestamp).or_else(|| {
-                value.as_i64().map(|number| {
-                    if number < 10_000_000_000 {
-                        number * 1000
-                    } else {
-                        number
-                    }
-                })
-            })
+            value
+                .as_str()
+                .and_then(parse_timestamp)
+                .or_else(|| value.as_i64().map(timestamp_number))
         })
+}
+
+fn timestamp_number(value: i64) -> i64 {
+    if value < 10_000_000_000 {
+        value * 1000
+    } else {
+        value
+    }
 }
 
 fn value_in_range(value: &Value, range: Option<&TimeRange>) -> bool {

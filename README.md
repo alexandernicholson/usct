@@ -367,7 +367,7 @@ This lets USCT bypass recursive discovery on an unchanged warm run while still i
 - a new project directory appears;
 - models.dev prices are refreshed.
 
-When one transcript changes, unchanged transcripts are reused from their per-session caches.
+When one transcript changes, unchanged transcript contributions are reused directly from the aggregate state.
 
 Aggregate states retain every session's normalized contribution, resolved model price, fingerprint, and parser progress. When one session changes, USCT subtracts its prior contribution and adds the updated contribution; unchanged sessions are reused directly from the aggregate state. Ordinary appends therefore avoid recursive discovery, per-session cache reads, and models.dev JSON decoding.
 
@@ -387,56 +387,55 @@ Plain JSON and SQLite stores retain the safe full-parser fallback because they d
 
 ## Performance
 
-Measurements were taken on macOS arm64 using 100 separate process invocations of the optimized release binary.
+Measurements were taken on macOS arm64 against the optimized release binary. Warm commands use 200 separate process invocations. Full-rebuild and incremental-append measurements use isolated temporary session and catalog paths so an existing cache cannot turn a rebuild into a cache hit.
 
-### Warm aggregate
+### Standalone process floor
 
-| Command | Median | p95 |
-|---|---:|---:|
-| `usct` | approximately 2.4–2.5 ms | approximately 2.8–2.9 ms |
-| `usct --source omp` | approximately 2.4 ms | approximately 2.7 ms |
-| `usct --period day` | approximately 3.0 ms | approximately 4.4 ms |
-
-### New and changing small sessions
-
-| Scenario | Median | p95 | Maximum |
+| Command | Runs | Median | p95 |
 |---|---:|---:|---:|
-| 100 unique uncached sessions | 2.818 ms | 3.317 ms | 3.590 ms |
-| Session changed before every run | 2.887 ms | 3.288 ms | 3.552 ms |
-| Uncached daily session | 3.198 ms | 4.367 ms | 6.463 ms |
+| `/usr/bin/true` | 200 | 1.491 ms | 2.133 ms |
+| `usct --help` | 200 | 2.907 ms | 3.275 ms |
 
-### Large active transcript append
+Darwin process creation consumes most of a warm USCT invocation. The CLI's application work is approximately 1.4 ms above the measured `/usr/bin/true` median.
 
-Measured by copying a 4,407,235-byte active OMP transcript, performing one full seed, then appending and pricing 100 new usage records:
+### Warm reports
 
-| Metric | Initial seed | Incremental append |
-|---|---:|---:|
-| Median | 350.578 ms | 5.150 ms |
-| p95 | — | 6.204 ms |
-| Maximum | — | 11.801 ms |
+| Command | Runs | Median | p95 |
+|---|---:|---:|---:|
+| `usct --period day` | 200 | 2.920 ms | 3.255 ms |
+| `usct --source omp --period day` | 200 | 2.981 ms | 3.495 ms |
+| `usct --source omp --session <active.jsonl>` | 200 | 3.095 ms | 3.582 ms |
 
-The one-time seed establishes persistent parser progress. Subsequent active-session refreshes process only appended records instead of reparsing the 4.4 MB history.
+These paths load a valid aggregate or session contribution and do not reparse transcript history.
 
-### Live all-provider append
+### Uncached small session
 
-The active tmux command aggregates 25 local sessions across Claude, Codex, and OMP. Its changed-session path improved as follows:
+Each of 50 runs used a new temporary catalog path and session path, forcing catalog decoding, session parsing, pricing, and an atomic cache write.
 
-| Implementation | Changed refresh |
-|---|---:|
-| Whole active-transcript reparse | approximately 350–380 ms |
-| Incremental transcript with full aggregate reconstruction | 50.794 ms |
-| Incremental per-session contributions | 14.145 ms |
-| Contribution deltas, embedded progress, and topology reuse | **3.835 ms** |
+| Runs | Median | p95 | Minimum | Maximum |
+|---:|---:|---:|---:|---:|
+| 50 | 5.086 ms | 7.184 ms | 4.617 ms | 12.314 ms |
 
-The final unchanged warm path measured 2.833 ms median and 3.142 ms p95. A changed active-session refresh is therefore now close to the normal process-launch-dominated warm path.
+### Active-transcript rebuild and append
 
-The daily all-provider state is approximately 8.6 KB and is updated with one atomic cache write. Earlier implementations wrote separate parser-progress, per-session, and aggregate files on an active append.
+The controlled source was a 7,786,869-byte OMP transcript containing 1,605 JSONL records. Every full-rebuild run copied it to a new temporary path. Every append run first seeded parser progress and then appended one complete usage record.
 
-### Process-launch floor
+| Scenario | Runs | Median | p95 | Minimum | Maximum |
+|---|---:|---:|---:|---:|---:|
+| Full rebuild before typed decoding | 15 | 15.254 ms | 15.513 ms | 14.717 ms | 15.556 ms |
+| **Full rebuild with borrowed OMP envelopes** | 100 | **9.995 ms** | **10.778 ms** | 9.371 ms | 10.978 ms |
+| Incremental append before typed decoding | 30 | 4.027 ms | 4.465 ms | 3.649 ms | 4.752 ms |
+| **Incremental append with borrowed OMP envelopes** | 100 | **3.699 ms** | **4.163 ms** | 3.218 ms | 10.732 ms |
 
-A standalone executable cannot provide a genuine sub-1 ms end-to-end invocation on the measured machine. `/usr/bin/true` alone measured approximately 1.5 ms median through the same process-launch benchmark. USCT's warm application work is under approximately 1 ms after accounting for that operating-system process floor, but total command latency remains around 2.4–2.5 ms.
+Typed decoding reduced the full-rebuild median by approximately 34.5%. It borrows the accounting fields needed by OMP and asks Serde to skip `content`, tool arguments, tool results, generated text, and unrelated metadata instead of constructing a recursive `serde_json::Value` tree for each record.
 
-Large JSONL transcripts require one full seed after installation, cache-schema changes, replacement, or truncation. Normal append-only updates are incremental. Plain JSON and SQLite sources use their safe full-parser fallback after invalidation.
+OMP records with known layouts use the typed path. Unknown record types containing usage fields fall back to recursive `Value` traversal, preserving compatibility with future or plugin-provided schemas. Nested `message.details.response.usage` records remain billable and are covered by a parser-equivalence contract.
+
+The one-time full rebuild is required after installation, cache-schema changes, replacement, or truncation. Normal append-only updates seek to the stored byte offset and decode only newly completed records. Plain JSON and SQLite sources retain their safe full-parser fallback.
+
+### Live aggregate state
+
+The daily all-provider command measured 2.920 ms median and 3.255 ms p95 over 200 warm invocations. Its aggregate state retains normalized contributions, resolved prices, transcript fingerprints, directory topology, and parser progress. A normal append avoids recursive discovery, unchanged session reads, and models.dev decoding, then performs one atomic aggregate-state write.
 
 ## Statusline integration
 

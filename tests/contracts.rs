@@ -291,6 +291,61 @@ fn incremental_parser_defers_partial_trailing_jsonl_records() {
 }
 
 #[test]
+fn typed_omp_parser_ignores_large_message_content() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("session.jsonl");
+    let content = format!(
+        "{} {{\"usage\":{{\"input\":999999}}}}",
+        "transcript payload ".repeat(50_000)
+    );
+    let line = serde_json::json!({
+        "type": "message",
+        "message": {
+            "role": "assistant",
+            "model": "gpt-test",
+            "content": content,
+            "usage": {"input": 100, "output": 10, "cacheRead": 20}
+        }
+    });
+    fs::write(&path, format!("{line}\n")).unwrap();
+    let (record, _) = parse_session_incremental(Harness::Omp, &path, None, None).unwrap();
+    assert_eq!(record.usage.input, 100);
+    assert_eq!(record.usage.output, 10);
+    assert_eq!(record.usage.cache_read, 20);
+}
+
+#[test]
+fn typed_omp_parser_preserves_nested_response_usage() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("session.jsonl");
+    fs::write(
+        &path,
+        concat!(
+            "{\"type\":\"message\",\"message\":{\"role\":\"tool\",\"details\":{\"response\":",
+            "{\"model\":\"gpt-test\",\"usage\":{\"inputTokens\":150,\"outputTokens\":9}}}}}\n"
+        ),
+    )
+    .unwrap();
+    let (record, _) = parse_session_incremental(Harness::Omp, &path, None, None).unwrap();
+    assert_eq!(record.usage.input, 150);
+    assert_eq!(record.usage.output, 9);
+}
+
+#[test]
+fn unknown_omp_records_retain_recursive_schema_fallback() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("session.jsonl");
+    fs::write(
+        &path,
+        "{\"type\":\"future_record\",\"payload\":{\"model\":\"gpt-test\",\"usage\":{\"input\":70,\"output\":7}}}\n",
+    )
+    .unwrap();
+    let (record, _) = parse_session_incremental(Harness::Omp, &path, None, None).unwrap();
+    assert_eq!(record.usage.input, 70);
+    assert_eq!(record.usage.output, 7);
+}
+
+#[test]
 fn aggregate_cache_reuses_only_unchanged_contributions() {
     let dir = tempdir().unwrap();
     let catalog = dir.path().join("models.json");
