@@ -18,6 +18,16 @@ impl TokenUsage {
         self.reasoning = self.reasoning.saturating_add(other.reasoning);
     }
 
+    pub fn saturating_sub(self, earlier: Self) -> Self {
+        Self {
+            input: self.input.saturating_sub(earlier.input),
+            output: self.output.saturating_sub(earlier.output),
+            cache_read: self.cache_read.saturating_sub(earlier.cache_read),
+            cache_write: self.cache_write.saturating_sub(earlier.cache_write),
+            reasoning: self.reasoning.saturating_sub(earlier.reasoning),
+        }
+    }
+
     pub fn is_empty(self) -> bool {
         self == Self::default()
     }

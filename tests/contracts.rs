@@ -4,7 +4,8 @@ use usct::{
     app,
     catalog::ModelsDevCatalog,
     domain::{Price, TokenUsage},
-    session::{Harness, parse_session},
+    session::{Harness, parse_session, parse_session_in_range},
+    time_range::{Period, custom_range},
 };
 
 #[test]
@@ -156,4 +157,58 @@ fn aggregate_report_sums_sessions_across_providers() {
     assert_eq!(report.usage.cache_read, 500_000);
     assert_eq!(report.usage.output, 300_000);
     assert!((report.cost - 13.5).abs() < 1e-12);
+}
+
+#[test]
+fn custom_range_uses_inclusive_start_and_exclusive_end() {
+    let range = custom_range("2026-07-12T00:00:00Z", Some("2026-07-13T00:00:00Z")).unwrap();
+    assert!(range.contains(range.start_ms));
+    assert!(!range.contains(range.end_ms.unwrap()));
+}
+
+#[test]
+fn built_in_periods_create_open_local_ranges() {
+    for (period, label) in [
+        (Period::Hour, "hour"),
+        (Period::Day, "day"),
+        (Period::Week, "week"),
+        (Period::Month, "month"),
+        (Period::Year, "year"),
+    ] {
+        let range = period.range().unwrap().unwrap();
+        assert_eq!(range.label, label);
+        assert!(range.end_ms.is_none());
+    }
+    assert!(Period::All.range().unwrap().is_none());
+    assert!(Period::Session.range().unwrap().is_none());
+}
+
+#[test]
+fn omp_parser_filters_usage_events_by_timestamp() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("session.jsonl");
+    fs::write(&path, concat!(
+        "{\"type\":\"message\",\"timestamp\":\"2026-07-11T23:59:59Z\",\"message\":{\"role\":\"assistant\",\"model\":\"gpt-test\",\"usage\":{\"input\":80,\"output\":20}}}\n",
+        "{\"type\":\"message\",\"timestamp\":\"2026-07-12T00:00:00Z\",\"message\":{\"role\":\"assistant\",\"model\":\"gpt-test\",\"usage\":{\"input\":100,\"output\":30}}}\n"
+    )).unwrap();
+    let range = custom_range("2026-07-12T00:00:00Z", Some("2026-07-13T00:00:00Z")).unwrap();
+    let record = parse_session_in_range(Harness::Omp, &path, Some(&range)).unwrap();
+    assert_eq!(record.usage.input, 100);
+    assert_eq!(record.usage.output, 30);
+}
+
+#[test]
+fn codex_range_subtracts_the_cumulative_baseline() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("rollout.jsonl");
+    fs::write(&path, concat!(
+        "{\"timestamp\":\"2026-07-11T23:59:59Z\",\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-test\"}}\n",
+        "{\"timestamp\":\"2026-07-11T23:59:59Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":100,\"cached_input_tokens\":20,\"output_tokens\":10}}}}\n",
+        "{\"timestamp\":\"2026-07-12T00:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":180,\"cached_input_tokens\":50,\"output_tokens\":25}}}}\n"
+    )).unwrap();
+    let range = custom_range("2026-07-12T00:00:00Z", Some("2026-07-13T00:00:00Z")).unwrap();
+    let record = parse_session_in_range(Harness::Codex, &path, Some(&range)).unwrap();
+    assert_eq!(record.usage.input, 50);
+    assert_eq!(record.usage.cache_read, 30);
+    assert_eq!(record.usage.output, 15);
 }

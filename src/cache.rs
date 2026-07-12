@@ -1,4 +1,4 @@
-use crate::domain::TokenUsage;
+use crate::{domain::TokenUsage, time_range::TimeRange};
 use serde::{Deserialize, Serialize};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::UNIX_EPOCH;
@@ -28,8 +28,8 @@ pub struct CachedSession {
     catalog: FileFingerprint,
 }
 
-pub fn load_session(path: &Path, catalog_path: &Path) -> Option<CachedSession> {
-    let cache_path = session_state_path(catalog_path, path)?;
+pub fn load_session(path: &Path, range_key: &str, catalog_path: &Path) -> Option<CachedSession> {
+    let cache_path = session_state_path(catalog_path, path, range_key)?;
     let bytes = fs::read(cache_path).ok()?;
     let session: CachedSession = serde_json::from_slice(&bytes).ok()?;
     (session.version == 1
@@ -38,8 +38,8 @@ pub fn load_session(path: &Path, catalog_path: &Path) -> Option<CachedSession> {
     .then_some(session)
 }
 
-pub fn save_session(session: &CachedSession, path: &Path, catalog_path: &Path) {
-    let Some(cache_path) = session_state_path(catalog_path, path) else {
+pub fn save_session(session: &CachedSession, path: &Path, range_key: &str, catalog_path: &Path) {
+    let Some(cache_path) = session_state_path(catalog_path, path, range_key) else {
         return;
     };
     write_atomic(&cache_path, session);
@@ -70,10 +70,17 @@ pub struct CachedReport {
     pub session_count: usize,
     pub usage: TokenUsage,
     pub cost_usd: f64,
+    pub range: Option<TimeRange>,
     version: u8,
     files: Vec<FileFingerprint>,
     directories: Vec<FileFingerprint>,
     catalog: FileFingerprint,
+}
+
+pub struct CacheContext<'a> {
+    pub session_paths: &'a [PathBuf],
+    pub directory_paths: &'a [PathBuf],
+    pub catalog_path: &'a Path,
 }
 
 impl CachedReport {
@@ -82,19 +89,19 @@ impl CachedReport {
         session_count: usize,
         usage: TokenUsage,
         cost_usd: f64,
-        session_paths: &[PathBuf],
-        directory_paths: &[PathBuf],
-        catalog_path: &Path,
+        range: Option<TimeRange>,
+        context: CacheContext<'_>,
     ) -> Result<Self, String> {
         Ok(Self {
             session_count,
             sources,
             usage,
             cost_usd,
-            version: 4,
-            files: fingerprints(session_paths)?,
-            directories: fingerprints(directory_paths)?,
-            catalog: fingerprint(catalog_path)?,
+            range,
+            version: 5,
+            files: fingerprints(context.session_paths)?,
+            directories: fingerprints(context.directory_paths)?,
+            catalog: fingerprint(context.catalog_path)?,
         })
     }
 }
@@ -103,7 +110,7 @@ pub fn load_report(scope: &str, catalog_path: &Path) -> Option<CachedReport> {
     let path = state_path(catalog_path, scope)?;
     let bytes = fs::read(path).ok()?;
     let report: CachedReport = serde_json::from_slice(&bytes).ok()?;
-    (report.version == 4
+    (report.version == 5
         && report.files == refresh(&report.files).ok()?
         && report.directories == refresh(&report.directories).ok()?
         && report.catalog == fingerprint(catalog_path).ok()?)
@@ -150,9 +157,14 @@ fn state_path(catalog_path: &Path, scope: &str) -> Option<PathBuf> {
     )
 }
 
-fn session_state_path(catalog_path: &Path, session_path: &Path) -> Option<PathBuf> {
+fn session_state_path(
+    catalog_path: &Path,
+    session_path: &Path,
+    range_key: &str,
+) -> Option<PathBuf> {
     let mut hasher = DefaultHasher::new();
     session_path.hash(&mut hasher);
+    range_key.hash(&mut hasher);
     Some(
         catalog_path
             .parent()?

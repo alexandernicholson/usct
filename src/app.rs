@@ -1,7 +1,8 @@
 use crate::{
     catalog::ModelsDevCatalog,
     domain::{Price, UsageRecord},
-    session::{Harness, parse_session},
+    session::{Harness, parse_session_in_range},
+    time_range::TimeRange,
 };
 use std::path::Path;
 
@@ -19,7 +20,16 @@ pub fn calculate(
     path: &Path,
     catalog: &ModelsDevCatalog,
 ) -> Result<CostReport, String> {
-    let record = parse_session(harness, path)?;
+    calculate_in_range(harness, path, catalog, None)
+}
+
+pub fn calculate_in_range(
+    harness: Harness,
+    path: &Path,
+    catalog: &ModelsDevCatalog,
+    range: Option<&TimeRange>,
+) -> Result<CostReport, String> {
+    let record = parse_session_in_range(harness, path, range)?;
     let pricing_id = pricing_id(harness, &record.model);
     let price = catalog.find(&pricing_id).ok_or_else(|| {
         format!(

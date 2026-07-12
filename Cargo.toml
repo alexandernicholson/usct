@@ -6,6 +6,7 @@ description = "Ultra-speedy coding-agent token cost tracker"
 license = "MIT"
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 pico-args = "0.5"
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

@@ -4,3 +4,4 @@ pub mod catalog;
 pub mod discovery;
 pub mod domain;
 pub mod session;
+pub mod time_range;

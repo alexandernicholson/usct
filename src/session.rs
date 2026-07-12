@@ -1,4 +1,7 @@
-use crate::domain::{TokenUsage, UsageRecord};
+use crate::{
+    domain::{TokenUsage, UsageRecord},
+    time_range::{TimeRange, parse_timestamp},
+};
 use rusqlite::Connection;
 use serde_json::{Map, Value};
 use std::{
@@ -54,14 +57,22 @@ impl FromStr for Harness {
 }
 
 pub fn parse_session(harness: Harness, path: &Path) -> Result<UsageRecord, String> {
+    parse_session_in_range(harness, path, None)
+}
+
+pub fn parse_session_in_range(
+    harness: Harness,
+    path: &Path,
+    range: Option<&TimeRange>,
+) -> Result<UsageRecord, String> {
     if path.extension().is_some_and(|ext| ext == "db") {
-        return parse_sqlite(path);
+        return parse_sqlite(path, range);
     }
     match harness {
-        Harness::Claude => parse_claude(path),
-        Harness::Codex => parse_codex(path),
-        Harness::Gemini => parse_generic(path, true),
-        _ => parse_generic(path, false),
+        Harness::Claude => parse_claude(path, range),
+        Harness::Codex => parse_codex(path, range),
+        Harness::Gemini => parse_generic(path, true, range),
+        _ => parse_generic(path, false, range),
     }
 }
 
@@ -82,7 +93,7 @@ fn json_lines(path: &Path) -> Result<Vec<Value>, String> {
     Ok(values)
 }
 
-fn parse_claude(path: &Path) -> Result<UsageRecord, String> {
+fn parse_claude(path: &Path, range: Option<&TimeRange>) -> Result<UsageRecord, String> {
     let mut model = None;
     let mut usage = TokenUsage::default();
     let mut seen = HashSet::new();
@@ -96,6 +107,9 @@ fn parse_claude(path: &Path) -> Result<UsageRecord, String> {
         if let Some(found) = message.get("model").and_then(Value::as_str) {
             model = Some(found.to_owned());
         }
+        if !value_in_range(&value, range) {
+            continue;
+        }
         let identity = message
             .get("id")
             .and_then(Value::as_str)
@@ -108,8 +122,9 @@ fn parse_claude(path: &Path) -> Result<UsageRecord, String> {
     finish(model, usage)
 }
 
-fn parse_codex(path: &Path) -> Result<UsageRecord, String> {
+fn parse_codex(path: &Path, range: Option<&TimeRange>) -> Result<UsageRecord, String> {
     let mut model = None;
+    let mut baseline = TokenUsage::default();
     let mut usage = TokenUsage::default();
     for value in json_lines(path)? {
         let payload = value.get("payload").unwrap_or(&value);
@@ -121,13 +136,24 @@ fn parse_codex(path: &Path) -> Result<UsageRecord, String> {
                 .pointer("/info/total_token_usage")
                 .and_then(Value::as_object)
         {
-            usage = usage_from(total, true);
+            let snapshot = usage_from(total, true);
+            if range.is_some()
+                && timestamp_ms(&value).is_some_and(|time| time < range.unwrap().start_ms)
+            {
+                baseline = snapshot;
+            } else if value_in_range(&value, range) {
+                usage = snapshot.saturating_sub(baseline);
+            }
         }
     }
     finish(model, usage)
 }
 
-fn parse_generic(path: &Path, cached_is_subset: bool) -> Result<UsageRecord, String> {
+fn parse_generic(
+    path: &Path,
+    cached_is_subset: bool,
+    range: Option<&TimeRange>,
+) -> Result<UsageRecord, String> {
     let mut model = None;
     let mut usage = TokenUsage::default();
     let mut seen = HashSet::new();
@@ -145,14 +171,30 @@ fn parse_generic(path: &Path, cached_is_subset: bool) -> Result<UsageRecord, Str
             let value: Value = serde_json::from_str(&line).map_err(|error| {
                 format!("invalid JSON at {}:{}: {error}", path.display(), index + 1)
             })?;
-            collect(&value, &mut model, &mut usage, &mut seen, cached_is_subset);
+            collect(
+                &value,
+                &mut model,
+                &mut usage,
+                &mut seen,
+                cached_is_subset,
+                range,
+                true,
+            );
         }
     } else {
         let bytes =
             fs::read(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
         let value: Value = serde_json::from_slice(&bytes)
             .map_err(|error| format!("invalid JSON in {}: {error}", path.display()))?;
-        collect(&value, &mut model, &mut usage, &mut seen, cached_is_subset);
+        collect(
+            &value,
+            &mut model,
+            &mut usage,
+            &mut seen,
+            cached_is_subset,
+            range,
+            true,
+        );
     }
     finish(model, usage)
 }
@@ -163,9 +205,14 @@ fn collect(
     total: &mut TokenUsage,
     seen: &mut HashSet<String>,
     cached_is_subset: bool,
+    range: Option<&TimeRange>,
+    inherited_allowed: bool,
 ) {
     match value {
         Value::Object(object) => {
+            let allowed = timestamp_ms(value).map_or(inherited_allowed, |time| {
+                range.is_none_or(|range| range.contains(time))
+            });
             if let Some(found) = find_string(value, &["model", "model_id", "modelID"]) {
                 *model = Some(found.to_owned());
             }
@@ -179,18 +226,26 @@ fn collect(
                     .get("id")
                     .and_then(Value::as_str)
                     .is_none_or(|identity| seen.insert(identity.to_owned()));
-                if should_count {
+                if allowed && should_count {
                     total.add_assign(usage_from(raw, cached_is_subset));
                 }
                 return;
             }
             for child in object.values() {
-                collect(child, model, total, seen, cached_is_subset);
+                collect(child, model, total, seen, cached_is_subset, range, allowed);
             }
         }
         Value::Array(items) => {
             for child in items {
-                collect(child, model, total, seen, cached_is_subset);
+                collect(
+                    child,
+                    model,
+                    total,
+                    seen,
+                    cached_is_subset,
+                    range,
+                    inherited_allowed,
+                );
             }
         }
         _ => {}
@@ -269,6 +324,28 @@ fn find_string<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
         .find_map(|key| object.get(*key).and_then(Value::as_str))
 }
 
+fn timestamp_ms(value: &Value) -> Option<i64> {
+    let object = value.as_object()?;
+    ["timestamp", "created_at", "createdAt", "time"]
+        .into_iter()
+        .find_map(|key| {
+            let value = object.get(key)?;
+            value.as_str().and_then(parse_timestamp).or_else(|| {
+                value.as_i64().map(|number| {
+                    if number < 10_000_000_000 {
+                        number * 1000
+                    } else {
+                        number
+                    }
+                })
+            })
+        })
+}
+
+fn value_in_range(value: &Value, range: Option<&TimeRange>) -> bool {
+    range.is_none_or(|range| timestamp_ms(value).is_some_and(|time| range.contains(time)))
+}
+
 fn finish(model: Option<String>, usage: TokenUsage) -> Result<UsageRecord, String> {
     let model = model.ok_or_else(|| "session contains usage but no model identifier".to_owned())?;
     if usage.is_empty() {
@@ -277,7 +354,7 @@ fn finish(model: Option<String>, usage: TokenUsage) -> Result<UsageRecord, Strin
     Ok(UsageRecord { model, usage })
 }
 
-fn parse_sqlite(path: &Path) -> Result<UsageRecord, String> {
+fn parse_sqlite(path: &Path, range: Option<&TimeRange>) -> Result<UsageRecord, String> {
     let connection = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
     let mut statement = connection
@@ -317,7 +394,7 @@ fn parse_sqlite(path: &Path) -> Result<UsageRecord, String> {
     let mut usage = TokenUsage::default();
     let mut seen = HashSet::new();
     for value in &values {
-        collect(value, &mut model, &mut usage, &mut seen, false);
+        collect(value, &mut model, &mut usage, &mut seen, false, range, true);
     }
     finish(model, usage)
 }

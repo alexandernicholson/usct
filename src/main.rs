@@ -5,7 +5,13 @@ use std::{
     process::ExitCode,
     str::FromStr,
 };
-use usct::{app, cache, catalog::ModelsDevCatalog, discovery, session::Harness};
+use usct::{
+    app, cache,
+    catalog::ModelsDevCatalog,
+    discovery,
+    session::Harness,
+    time_range::{Period, TimeRange, custom_range},
+};
 
 fn main() -> ExitCode {
     match run() {
@@ -58,6 +64,16 @@ fn run() -> Result<String, String> {
         .opt_value_from_str("--format")
         .map_err(|error| error.to_string())?
         .unwrap_or_else(|| "compact".to_owned());
+    let period_value: String = args
+        .opt_value_from_str("--period")
+        .map_err(|error| error.to_string())?
+        .unwrap_or_else(|| "all".to_owned());
+    let from: Option<String> = args
+        .opt_value_from_str("--from")
+        .map_err(|error| error.to_string())?;
+    let to: Option<String> = args
+        .opt_value_from_str("--to")
+        .map_err(|error| error.to_string())?;
     if args.contains(["-h", "--help"]) {
         return Ok(help().to_owned());
     }
@@ -65,21 +81,41 @@ fn run() -> Result<String, String> {
     if format != "compact" && format != "json" {
         return Err(format!("unsupported format '{format}'"));
     }
+    let period = Period::parse(&period_value)?;
+    let range = if let Some(from) = from.as_deref() {
+        if period != Period::All {
+            return Err("--from cannot be combined with a non-all --period".to_owned());
+        }
+        Some(custom_range(from, to.as_deref())?)
+    } else {
+        if to.is_some() {
+            return Err("--to requires --from".to_owned());
+        }
+        period.range()?
+    };
     let constrained = if source == "auto" {
         None
     } else {
         Some(Harness::from_str(&source)?)
     };
-    let scope = session.as_ref().map_or_else(
+    let range_key = range
+        .as_ref()
+        .map_or_else(|| period_value.clone(), TimeRange::cache_key);
+    let base_scope = session.as_ref().map_or_else(
         || format!("source:{source}"),
         |path| format!("session:{}", path.display()),
     );
+    let scope = format!("{base_scope}:range:{range_key}");
     let catalog_path = cache::models_path();
     if let Some(report) = cache::load_report(&scope, &catalog_path) {
         return render_report(&report, &format);
     }
     let sessions: Vec<(Harness, PathBuf)> = match session {
         Some(path) => vec![(constrained.unwrap_or_else(|| infer_harness(&path)), path)],
+        None if period == Period::Session => {
+            let found = discovery::latest(constrained)?;
+            vec![(found.harness, found.path)]
+        }
         None => discovery::all(constrained)?
             .into_iter()
             .map(|found| (found.harness, found.path))
@@ -89,15 +125,24 @@ fn run() -> Result<String, String> {
     let directory_paths = watch_directories(constrained, &session_paths);
     let catalog = ModelsDevCatalog::from_path(&catalog_path)
         .map_err(|error| format!("{error}; run 'usct update'"))?;
-    let calculated = calculate_sessions(&sessions, &catalog, &catalog_path)?;
+    let calculated = calculate_sessions(
+        &sessions,
+        &catalog,
+        &catalog_path,
+        &range_key,
+        range.as_ref(),
+    )?;
     let report = cache::CachedReport::new(
         calculated.sources,
         calculated.session_count,
         calculated.usage,
         calculated.cost,
-        &session_paths,
-        &directory_paths,
-        &catalog_path,
+        range.clone(),
+        cache::CacheContext {
+            session_paths: &session_paths,
+            directory_paths: &directory_paths,
+            catalog_path: &catalog_path,
+        },
     )?;
     cache::save_report(&report, &scope, &catalog_path);
     render_report(&report, &format)
@@ -107,17 +152,19 @@ fn calculate_sessions(
     sessions: &[(Harness, PathBuf)],
     catalog: &ModelsDevCatalog,
     catalog_path: &Path,
+    range_key: &str,
+    range: Option<&TimeRange>,
 ) -> Result<app::AggregateReport, String> {
     let mut sources = Vec::new();
     let mut usage = usct::domain::TokenUsage::default();
     let mut cost = 0.0;
     let mut session_count = 0;
     for (harness, path) in sessions {
-        let cached = cache::load_session(path, catalog_path);
+        let cached = cache::load_session(path, range_key, catalog_path);
         let session = if let Some(cached) = cached {
             cached
         } else {
-            let report = match app::calculate(*harness, path, catalog) {
+            let report = match app::calculate_in_range(*harness, path, catalog, range) {
                 Ok(report) => report,
                 Err(error) if error == "session contains no token usage" => continue,
                 Err(error) => return Err(format!("{}: {error}", path.display())),
@@ -129,7 +176,7 @@ fn calculate_sessions(
                 path,
                 catalog_path,
             )?;
-            cache::save_session(&cached, path, catalog_path);
+            cache::save_session(&cached, path, range_key, catalog_path);
             cached
         };
         if !sources.contains(&session.source) {
@@ -157,6 +204,11 @@ fn render_report(report: &cache::CachedReport, format: &str) -> Result<String, S
             "cost_usd": report.cost_usd,
             "sources": report.sources,
             "session_count": report.session_count,
+            "range": report.range.as_ref().map(|range| json!({
+                "label": range.label,
+                "from": range.start_rfc3339(),
+                "to": range.end_rfc3339()
+            })),
             "tokens": {
                 "input": report.usage.input,
                 "output": report.usage.output,
@@ -232,5 +284,5 @@ fn ensure_no_args(args: Arguments) -> Result<(), String> {
 }
 
 fn help() -> &'static str {
-    "usct — ultra-speedy coding-agent cost tracker\n\nUSAGE:\n  usct [--source auto|claude|codex|pi|omp|opencode|gemini|amp] [--session PATH] [--format compact|json]\n  usct update\n  usct sources"
+    "usct — ultra-speedy coding-agent cost tracker\n\nUSAGE:\n  usct [--source SOURCE] [--period PERIOD] [--session PATH] [--format FORMAT]\n  usct [--source SOURCE] --from DATE_OR_TIMESTAMP [--to DATE_OR_TIMESTAMP] [--format FORMAT]\n  usct update\n  usct sources\n\nSOURCES:\n  auto, claude, codex, pi, omp, opencode, gemini, amp\n\nPERIODS:\n  all (default), session, hour, day, week, month, year\n\nFORMATS:\n  compact (default), json\n\nDATES:\n  YYYY-MM-DD, YYYY-MM-DDTHH:MM:SS (local), or RFC 3339\n  --from is inclusive; --to is exclusive"
 }

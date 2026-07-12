@@ -105,7 +105,13 @@ cost="$(usct)"
 
 ```text
 usct [--source auto|claude|codex|pi|omp|opencode|gemini|amp]
+     [--period all|session|hour|day|week|month|year]
      [--session PATH]
+     [--format compact|json]
+
+usct [--source SOURCE]
+     --from DATE_OR_TIMESTAMP
+     [--to DATE_OR_TIMESTAMP]
      [--format compact|json]
 
 usct update
@@ -138,6 +144,55 @@ usct --source omp
 
 For example, `usct --source omp` includes every OMP transcript under `~/.omp/agent/sessions`, not merely the most recently modified session.
 
+### Select a time period
+
+`--period` limits usage to a named local-time window:
+
+```bash
+usct --period session
+usct --period hour
+usct --period day
+usct --period week
+usct --period month
+usct --period year
+```
+
+| Period | Meaning |
+|---|---|
+| `all` | All discovered usage; this is the default. |
+| `session` | The most recently modified session in the selected source scope. |
+| `hour` | Usage since the beginning of the current local clock hour. |
+| `day` | Usage since local midnight. |
+| `week` | Usage since Monday at local midnight. |
+| `month` | Usage since the first day of the local calendar month. |
+| `year` | Usage since January 1 in the local timezone. |
+
+Time periods combine with source selection:
+
+```bash
+usct --source claude --period day
+usct --source codex --period month
+usct --source omp --period session
+```
+
+### Select a custom range
+
+Use inclusive `--from` and optional exclusive `--to` boundaries:
+
+```bash
+usct --from 2026-07-01 --to 2026-08-01
+usct --source omp --from 2026-07-12T09:00:00 --to 2026-07-12T17:00:00
+usct --from 2026-07-12T00:00:00Z --to 2026-07-13T00:00:00Z
+```
+
+Accepted boundary formats:
+
+- `YYYY-MM-DD`, interpreted as local midnight;
+- `YYYY-MM-DDTHH:MM:SS`, interpreted in the local timezone;
+- RFC 3339 timestamps with an explicit offset or `Z`.
+
+Omitting `--to` creates an open-ended range. `--from` cannot be combined with a named period other than the default `all`.
+
 ### Price one explicit session
 
 `--session` changes the scope to exactly one transcript:
@@ -167,6 +222,11 @@ Example:
   "cost_usd": 309.32652670000004,
   "session_count": 25,
   "sources": ["claude", "codex", "omp"],
+  "range": {
+    "label": "day",
+    "from": "2026-07-11T15:00:00+00:00",
+    "to": null
+  },
   "tokens": {
     "cache_read": 281430267,
     "cache_write": 2540859,
@@ -182,6 +242,7 @@ Fields:
 - `cost_usd`: aggregate calculated cost in US dollars.
 - `session_count`: sessions containing billable token usage.
 - `sources`: sources represented in the total.
+- `range`: effective UTC-normalized range metadata, or `null` for all-time and session reports.
 - `tokens.input`: ordinary, non-cached input tokens where the source distinguishes them.
 - `tokens.output`: output tokens excluding separately reported reasoning tokens.
 - `tokens.cache_read`: tokens served from a provider cache.
@@ -318,6 +379,7 @@ Measurements were taken on macOS arm64 using 100 separate process invocations of
 |---|---:|---:|
 | `usct` | approximately 2.4–2.5 ms | approximately 2.8–2.9 ms |
 | `usct --source omp` | approximately 2.4 ms | approximately 2.7 ms |
+| `usct --period day` | approximately 3.0 ms | approximately 4.4 ms |
 
 ### New and changing small sessions
 
@@ -325,6 +387,7 @@ Measurements were taken on macOS arm64 using 100 separate process invocations of
 |---|---:|---:|---:|
 | 100 unique uncached sessions | 2.818 ms | 3.317 ms | 3.590 ms |
 | Session changed before every run | 2.887 ms | 3.288 ms | 3.552 ms |
+| Uncached daily session | 3.198 ms | 4.367 ms | 6.463 ms |
 
 ### Process-launch floor
 
@@ -351,7 +414,7 @@ Starship may suppress rendering when `TERM=dumb`; that behavior comes from Stars
 ### tmux
 
 ```tmux
-set -g status-right '#(usct) %H:%M'
+set -g status-right '#(usct --period day) %H:%M'
 ```
 
 Choose a tmux status interval appropriate for how frequently the underlying harness writes usage:
