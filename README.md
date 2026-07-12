@@ -430,7 +430,7 @@ The active tmux command aggregates 25 local sessions across Claude, Codex, and O
 
 The final unchanged warm path measured 2.833 ms median and 3.142 ms p95. A changed active-session refresh is therefore now close to the normal process-launch-dominated warm path.
 
-The daily all-provider state measured 8,635 bytes and is updated with one atomic cache write. Earlier implementations wrote separate parser-progress, per-session, and aggregate files on an active append.
+The daily all-provider state is approximately 8.6 KB and is updated with one atomic cache write. Earlier implementations wrote separate parser-progress, per-session, and aggregate files on an active append.
 
 ### Process-launch floor
 
