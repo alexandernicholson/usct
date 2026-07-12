@@ -3,11 +3,13 @@ use crate::{
     time_range::{TimeRange, parse_timestamp},
 };
 use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::{
     collections::HashSet,
     fs,
-    io::{BufRead, BufReader},
+    hash::{DefaultHasher, Hash, Hasher},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::Path,
     str::FromStr,
 };
@@ -74,6 +76,193 @@ pub fn parse_session_in_range(
         Harness::Gemini => parse_generic(path, true, range),
         _ => parse_generic(path, false, range),
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParserProgress {
+    version: u8,
+    harness: String,
+    identity: u128,
+    offset: u64,
+    tail_hash: u64,
+    model: Option<String>,
+    usage: TokenUsage,
+    seen_ids: HashSet<String>,
+    codex_baseline: TokenUsage,
+    range_start_ms: Option<i64>,
+    range_end_ms: Option<i64>,
+}
+
+pub fn parse_session_incremental(
+    harness: Harness,
+    path: &Path,
+    range: Option<&TimeRange>,
+    previous: Option<ParserProgress>,
+) -> Result<(UsageRecord, Option<ParserProgress>), String> {
+    if path
+        .extension()
+        .is_none_or(|extension| extension != "jsonl")
+    {
+        return parse_session_in_range(harness, path, range).map(|record| (record, None));
+    }
+    let metadata = fs::metadata(path)
+        .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+    let identity = file_identity(&metadata);
+    let range_start_ms = range.map(|range| range.start_ms);
+    let range_end_ms = range.and_then(|range| range.end_ms);
+    let mut state = previous
+        .filter(|state| {
+            state.version == 1
+                && state.harness == harness.name()
+                && state.identity == identity
+                && state.offset <= metadata.len()
+                && state.range_start_ms == range_start_ms
+                && state.range_end_ms == range_end_ms
+                && tail_hash(path, state.offset).is_some_and(|hash| hash == state.tail_hash)
+        })
+        .unwrap_or_else(|| ParserProgress {
+            version: 1,
+            harness: harness.name().to_owned(),
+            identity,
+            offset: 0,
+            tail_hash: 0,
+            model: None,
+            usage: TokenUsage::default(),
+            seen_ids: HashSet::new(),
+            codex_baseline: TokenUsage::default(),
+            range_start_ms,
+            range_end_ms,
+        });
+    let file =
+        fs::File::open(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    reader
+        .seek(SeekFrom::Start(state.offset))
+        .map_err(|error| format!("cannot seek {}: {error}", path.display()))?;
+    loop {
+        let mut bytes = Vec::new();
+        let read = reader
+            .read_until(b'\n', &mut bytes)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        if !bytes.ends_with(b"\n") {
+            break;
+        }
+        state.offset = state.offset.saturating_add(read as u64);
+        let line = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let value: Value = serde_json::from_slice(line).map_err(|error| {
+            format!(
+                "invalid JSON near byte {} in {}: {error}",
+                state.offset,
+                path.display()
+            )
+        })?;
+        process_incremental_value(harness, &value, range, &mut state);
+    }
+    state.tail_hash = tail_hash(path, state.offset).unwrap_or(0);
+    let record = finish(state.model.clone(), state.usage)?;
+    Ok((record, Some(state)))
+}
+
+fn process_incremental_value(
+    harness: Harness,
+    value: &Value,
+    range: Option<&TimeRange>,
+    state: &mut ParserProgress,
+) {
+    match harness {
+        Harness::Claude => {
+            let Some(message) = value.get("message").and_then(Value::as_object) else {
+                return;
+            };
+            if let Some(model) = message.get("model").and_then(Value::as_str) {
+                state.model = Some(model.to_owned());
+            }
+            let Some(raw_usage) = message.get("usage").and_then(Value::as_object) else {
+                return;
+            };
+            if !value_in_range(value, range) {
+                return;
+            }
+            let should_count = message
+                .get("id")
+                .and_then(Value::as_str)
+                .is_none_or(|identity| state.seen_ids.insert(identity.to_owned()));
+            if should_count {
+                state.usage.add_assign(usage_from(raw_usage, false));
+            }
+        }
+        Harness::Codex => {
+            let payload = value.get("payload").unwrap_or(value);
+            if let Some(model) = find_string(payload, &["model", "model_id", "modelID"]) {
+                state.model = Some(model.to_owned());
+            }
+            if payload.get("type").and_then(Value::as_str) != Some("token_count") {
+                return;
+            }
+            let Some(total) = payload
+                .pointer("/info/total_token_usage")
+                .and_then(Value::as_object)
+            else {
+                return;
+            };
+            let snapshot = usage_from(total, true);
+            if range.is_some()
+                && timestamp_ms(value).is_some_and(|time| time < range.unwrap().start_ms)
+            {
+                state.codex_baseline = snapshot;
+            } else if value_in_range(value, range) {
+                state.usage = snapshot.saturating_sub(state.codex_baseline);
+            }
+        }
+        _ => {
+            let cached_is_subset = harness == Harness::Gemini;
+            collect(
+                value,
+                &mut state.model,
+                &mut state.usage,
+                &mut state.seen_ids,
+                cached_is_subset,
+                range,
+                true,
+            );
+        }
+    }
+}
+
+fn tail_hash(path: &Path, offset: u64) -> Option<u64> {
+    if offset == 0 {
+        return Some(0);
+    }
+    let start = offset.saturating_sub(4096);
+    let mut file = fs::File::open(path).ok()?;
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut bytes = vec![0; (offset - start) as usize];
+    file.read_exact(&mut bytes).ok()?;
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    Some(hasher.finish())
+}
+
+#[cfg(unix)]
+fn file_identity(metadata: &fs::Metadata) -> u128 {
+    use std::os::unix::fs::MetadataExt;
+    ((metadata.dev() as u128) << 64) | metadata.ino() as u128
+}
+
+#[cfg(not(unix))]
+fn file_identity(metadata: &fs::Metadata) -> u128 {
+    metadata
+        .created()
+        .ok()
+        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(metadata.len() as u128, |value| value.as_nanos())
 }
 
 fn json_lines(path: &Path) -> Result<Vec<Value>, String> {

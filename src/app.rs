@@ -30,6 +30,15 @@ pub fn calculate_in_range(
     range: Option<&TimeRange>,
 ) -> Result<CostReport, String> {
     let record = parse_session_in_range(harness, path, range)?;
+    price_record(harness, path, catalog, record)
+}
+
+pub fn price_record(
+    harness: Harness,
+    path: &Path,
+    catalog: &ModelsDevCatalog,
+    record: UsageRecord,
+) -> Result<CostReport, String> {
     let pricing_id = pricing_id(harness, &record.model);
     let price = catalog.find(&pricing_id).ok_or_else(|| {
         format!(

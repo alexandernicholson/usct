@@ -369,6 +369,20 @@ This lets USCT bypass recursive discovery on an unchanged warm run while still i
 
 When one transcript changes, unchanged transcripts are reused from their per-session caches.
 
+For append-only JSONL transcripts, USCT also persists source-specific parser progress:
+
+- the byte offset of the last complete JSONL record;
+- a hash of the trailing parsed bytes;
+- filesystem identity for replacement detection;
+- accumulated normalized usage;
+- model and message-ID deduplication state;
+- the Codex cumulative baseline;
+- effective time-range boundaries.
+
+When an active harness appends a record, USCT seeks directly to the prior byte offset and parses only complete newly appended records. A partial trailing JSONL record is deferred until a later append supplies its terminating newline. Truncation, replacement, changed file identity, or a mismatching tail hash triggers a safe full rebuild.
+
+Plain JSON and SQLite stores retain the safe full-parser fallback because they do not provide an append-only JSONL boundary.
+
 ## Performance
 
 Measurements were taken on macOS arm64 using 100 separate process invocations of the optimized release binary.
@@ -389,11 +403,23 @@ Measurements were taken on macOS arm64 using 100 separate process invocations of
 | Session changed before every run | 2.887 ms | 3.288 ms | 3.552 ms |
 | Uncached daily session | 3.198 ms | 4.367 ms | 6.463 ms |
 
+### Large active transcript append
+
+Measured by copying a 4,407,235-byte active OMP transcript, performing one full seed, then appending and pricing 100 new usage records:
+
+| Metric | Initial seed | Incremental append |
+|---|---:|---:|
+| Median | 350.578 ms | 5.150 ms |
+| p95 | — | 6.204 ms |
+| Maximum | — | 11.801 ms |
+
+The one-time seed establishes persistent parser progress. Subsequent active-session refreshes process only appended records instead of reparsing the 4.4 MB history.
+
 ### Process-launch floor
 
 A standalone executable cannot provide a genuine sub-1 ms end-to-end invocation on the measured machine. `/usr/bin/true` alone measured approximately 1.5 ms median through the same process-launch benchmark. USCT's warm application work is under approximately 1 ms after accounting for that operating-system process floor, but total command latency remains around 2.4–2.5 ms.
 
-Large changed transcripts can take longer on the first invalidated run because that transcript must be reparsed. Subsequent unchanged invocations use the warm cache.
+Large JSONL transcripts require one full seed after installation, cache-schema changes, replacement, or truncation. Normal append-only updates are incremental. Plain JSON and SQLite sources use their safe full-parser fallback after invalidation.
 
 ## Statusline integration
 

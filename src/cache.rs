@@ -1,4 +1,4 @@
-use crate::{domain::TokenUsage, time_range::TimeRange};
+use crate::{domain::TokenUsage, session::ParserProgress, time_range::TimeRange};
 use serde::{Deserialize, Serialize};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::UNIX_EPOCH;
@@ -28,11 +28,23 @@ pub struct CachedSession {
     catalog: FileFingerprint,
 }
 
+pub fn load_progress(path: &Path, range_key: &str, catalog_path: &Path) -> Option<ParserProgress> {
+    let cache_path = progress_state_path(catalog_path, path, range_key)?;
+    serde_json::from_slice(&fs::read(cache_path).ok()?).ok()
+}
+
+pub fn save_progress(progress: &ParserProgress, path: &Path, range_key: &str, catalog_path: &Path) {
+    let Some(cache_path) = progress_state_path(catalog_path, path, range_key) else {
+        return;
+    };
+    write_atomic(&cache_path, progress);
+}
+
 pub fn load_session(path: &Path, range_key: &str, catalog_path: &Path) -> Option<CachedSession> {
     let cache_path = session_state_path(catalog_path, path, range_key)?;
     let bytes = fs::read(cache_path).ok()?;
     let session: CachedSession = serde_json::from_slice(&bytes).ok()?;
-    (session.version == 1
+    (session.version == 2
         && session.file == fingerprint(path).ok()?
         && session.catalog == fingerprint(catalog_path).ok()?)
     .then_some(session)
@@ -57,7 +69,7 @@ impl CachedSession {
             source,
             usage,
             cost_usd,
-            version: 1,
+            version: 2,
             file: fingerprint(path)?,
             catalog: fingerprint(catalog_path)?,
         })
@@ -98,7 +110,7 @@ impl CachedReport {
             usage,
             cost_usd,
             range,
-            version: 5,
+            version: 6,
             files: fingerprints(context.session_paths)?,
             directories: fingerprints(context.directory_paths)?,
             catalog: fingerprint(context.catalog_path)?,
@@ -110,7 +122,7 @@ pub fn load_report(scope: &str, catalog_path: &Path) -> Option<CachedReport> {
     let path = state_path(catalog_path, scope)?;
     let bytes = fs::read(path).ok()?;
     let report: CachedReport = serde_json::from_slice(&bytes).ok()?;
-    (report.version == 5
+    (report.version == 6
         && report.files == refresh(&report.files).ok()?
         && report.directories == refresh(&report.directories).ok()?
         && report.catalog == fingerprint(catalog_path).ok()?)
@@ -169,6 +181,20 @@ fn session_state_path(
         catalog_path
             .parent()?
             .join(format!("session-{:016x}.json", hasher.finish())),
+    )
+}
+fn progress_state_path(
+    catalog_path: &Path,
+    session_path: &Path,
+    range_key: &str,
+) -> Option<PathBuf> {
+    let mut hasher = DefaultHasher::new();
+    session_path.hash(&mut hasher);
+    range_key.hash(&mut hasher);
+    Some(
+        catalog_path
+            .parent()?
+            .join(format!("progress-{:016x}.json", hasher.finish())),
     )
 }
 

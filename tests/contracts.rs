@@ -1,10 +1,10 @@
-use std::{fs, process::Command};
+use std::{fs, io::Write, process::Command};
 use tempfile::tempdir;
 use usct::{
     app,
     catalog::ModelsDevCatalog,
     domain::{Price, TokenUsage},
-    session::{Harness, parse_session, parse_session_in_range},
+    session::{Harness, parse_session, parse_session_in_range, parse_session_incremental},
     time_range::{Period, custom_range},
 };
 
@@ -210,5 +210,82 @@ fn codex_range_subtracts_the_cumulative_baseline() {
     let record = parse_session_in_range(Harness::Codex, &path, Some(&range)).unwrap();
     assert_eq!(record.usage.input, 50);
     assert_eq!(record.usage.cache_read, 30);
+    assert_eq!(record.usage.output, 15);
+}
+
+#[test]
+fn incremental_omp_parser_reads_only_appended_records() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("session.jsonl");
+    let first = "{\"type\":\"message\",\"timestamp\":\"2026-07-12T00:00:00Z\",\"message\":{\"role\":\"assistant\",\"model\":\"gpt-test\",\"usage\":{\"input\":100,\"output\":10}}}\n";
+    let second = "{\"type\":\"message\",\"timestamp\":\"2026-07-12T00:01:00Z\",\"message\":{\"role\":\"assistant\",\"model\":\"gpt-test\",\"usage\":{\"input\":50,\"output\":5}}}\n";
+    fs::write(&path, first).unwrap();
+    let (record, state) = parse_session_incremental(Harness::Omp, &path, None, None).unwrap();
+    assert_eq!(record.usage.input, 100);
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(second.as_bytes())
+        .unwrap();
+    let (record, _) = parse_session_incremental(Harness::Omp, &path, None, state).unwrap();
+    assert_eq!(record.usage.input, 150);
+    assert_eq!(record.usage.output, 15);
+}
+
+#[test]
+fn incremental_parser_rebuilds_after_in_place_replacement() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("session.jsonl");
+    let original = "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"model\":\"gpt-test\",\"usage\":{\"input\":100,\"output\":10}}}\n";
+    let replacement = "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"model\":\"gpt-test\",\"usage\":{\"input\":900,\"output\":90}}}\n";
+    fs::write(&path, original).unwrap();
+    let (_, state) = parse_session_incremental(Harness::Omp, &path, None, None).unwrap();
+    fs::write(&path, replacement).unwrap();
+    let (record, _) = parse_session_incremental(Harness::Omp, &path, None, state).unwrap();
+    assert_eq!(record.usage.input, 900);
+    assert_eq!(record.usage.output, 90);
+}
+
+#[test]
+fn incremental_codex_parser_updates_the_latest_cumulative_delta() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("rollout.jsonl");
+    fs::write(&path, concat!(
+        "{\"timestamp\":\"2026-07-11T23:59:59Z\",\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-test\"}}\n",
+        "{\"timestamp\":\"2026-07-11T23:59:59Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":100,\"cached_input_tokens\":20,\"output_tokens\":10}}}}\n",
+        "{\"timestamp\":\"2026-07-12T00:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":180,\"cached_input_tokens\":50,\"output_tokens\":25}}}}\n"
+    )).unwrap();
+    let range = custom_range("2026-07-12T00:00:00Z", None).unwrap();
+    let (record, state) =
+        parse_session_incremental(Harness::Codex, &path, Some(&range), None).unwrap();
+    assert_eq!(record.usage.input, 50);
+    fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(
+        b"{\"timestamp\":\"2026-07-12T00:02:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":250,\"cached_input_tokens\":70,\"output_tokens\":30}}}}\n"
+    ).unwrap();
+    let (record, _) =
+        parse_session_incremental(Harness::Codex, &path, Some(&range), state).unwrap();
+    assert_eq!(record.usage.input, 100);
+    assert_eq!(record.usage.cache_read, 50);
+    assert_eq!(record.usage.output, 20);
+}
+
+#[test]
+fn incremental_parser_defers_partial_trailing_jsonl_records() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("session.jsonl");
+    let complete = "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"model\":\"gpt-test\",\"usage\":{\"input\":100,\"output\":10}}}\n";
+    let partial = "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"model\":\"gpt-test\",\"usage\":{\"input\":50";
+    fs::write(&path, format!("{complete}{partial}")).unwrap();
+    let (record, state) = parse_session_incremental(Harness::Omp, &path, None, None).unwrap();
+    assert_eq!(record.usage.input, 100);
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b",\"output\":5}}}\n")
+        .unwrap();
+    let (record, _) = parse_session_incremental(Harness::Omp, &path, None, state).unwrap();
+    assert_eq!(record.usage.input, 150);
     assert_eq!(record.usage.output, 15);
 }

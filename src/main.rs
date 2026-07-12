@@ -9,7 +9,7 @@ use usct::{
     app, cache,
     catalog::ModelsDevCatalog,
     discovery,
-    session::Harness,
+    session::{Harness, parse_session_incremental},
     time_range::{Period, TimeRange, custom_range},
 };
 
@@ -160,15 +160,18 @@ fn calculate_sessions(
     let mut cost = 0.0;
     let mut session_count = 0;
     for (harness, path) in sessions {
-        let cached = cache::load_session(path, range_key, catalog_path);
-        let session = if let Some(cached) = cached {
+        let session = if let Some(cached) = cache::load_session(path, range_key, catalog_path) {
             cached
         } else {
-            let report = match app::calculate_in_range(*harness, path, catalog, range) {
-                Ok(report) => report,
-                Err(error) if error == "session contains no token usage" => continue,
-                Err(error) => return Err(format!("{}: {error}", path.display())),
-            };
+            let progress = cache::load_progress(path, range_key, catalog_path);
+            let (record, progress) =
+                match parse_session_incremental(*harness, path, range, progress) {
+                    Ok(result) => result,
+                    Err(error) if error == "session contains no token usage" => continue,
+                    Err(error) => return Err(format!("{}: {error}", path.display())),
+                };
+            let report = app::price_record(*harness, path, catalog, record)
+                .map_err(|error| format!("{}: {error}", path.display()))?;
             let cached = cache::CachedSession::new(
                 harness.name().to_owned(),
                 report.record.usage,
@@ -176,6 +179,9 @@ fn calculate_sessions(
                 path,
                 catalog_path,
             )?;
+            if let Some(progress) = progress.as_ref() {
+                cache::save_progress(progress, path, range_key, catalog_path);
+            }
             cache::save_session(&cached, path, range_key, catalog_path);
             cached
         };
