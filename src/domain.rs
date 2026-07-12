@@ -1,0 +1,51 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenUsage {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub reasoning: u64,
+}
+
+impl TokenUsage {
+    pub fn add_assign(&mut self, other: Self) {
+        self.input = self.input.saturating_add(other.input);
+        self.output = self.output.saturating_add(other.output);
+        self.cache_read = self.cache_read.saturating_add(other.cache_read);
+        self.cache_write = self.cache_write.saturating_add(other.cache_write);
+        self.reasoning = self.reasoning.saturating_add(other.reasoning);
+    }
+
+    pub fn is_empty(self) -> bool {
+        self == Self::default()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Price {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: Option<f64>,
+    pub cache_write: Option<f64>,
+    pub reasoning: Option<f64>,
+}
+
+impl Price {
+    pub fn cost(self, usage: TokenUsage) -> f64 {
+        let million = 1_000_000.0;
+        (usage.input as f64 * self.input
+            + usage.output as f64 * self.output
+            + usage.cache_read as f64 * self.cache_read.unwrap_or(self.input)
+            + usage.cache_write as f64 * self.cache_write.unwrap_or(self.input)
+            + usage.reasoning as f64 * self.reasoning.unwrap_or(self.output))
+            / million
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageRecord {
+    pub model: String,
+    pub usage: TokenUsage,
+}

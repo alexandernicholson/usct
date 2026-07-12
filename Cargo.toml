@@ -1,0 +1,23 @@
+[package]
+name = "usct"
+version = "0.1.0"
+edition = "2024"
+description = "Ultra-speedy coding-agent token cost tracker"
+license = "MIT"
+
+[dependencies]
+pico-args = "0.5"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+walkdir = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+opt-level = 3
+panic = "abort"
+strip = true

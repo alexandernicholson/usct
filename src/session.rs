@@ -1,0 +1,323 @@
+use crate::domain::{TokenUsage, UsageRecord};
+use rusqlite::Connection;
+use serde_json::{Map, Value};
+use std::{
+    collections::HashSet,
+    fs,
+    io::{BufRead, BufReader},
+    path::Path,
+    str::FromStr,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Harness {
+    Claude,
+    Codex,
+    Pi,
+    Omp,
+    OpenCode,
+    Gemini,
+    Amp,
+}
+
+impl Harness {
+    pub const ALL: [Self; 7] = [
+        Self::Claude,
+        Self::Codex,
+        Self::Pi,
+        Self::Omp,
+        Self::OpenCode,
+        Self::Gemini,
+        Self::Amp,
+    ];
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Pi => "pi",
+            Self::Omp => "omp",
+            Self::OpenCode => "opencode",
+            Self::Gemini => "gemini",
+            Self::Amp => "amp",
+        }
+    }
+}
+
+impl FromStr for Harness {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|item| item.name() == value)
+            .ok_or_else(|| format!("unsupported source '{value}'"))
+    }
+}
+
+pub fn parse_session(harness: Harness, path: &Path) -> Result<UsageRecord, String> {
+    if path.extension().is_some_and(|ext| ext == "db") {
+        return parse_sqlite(path);
+    }
+    match harness {
+        Harness::Claude => parse_claude(path),
+        Harness::Codex => parse_codex(path),
+        Harness::Gemini => parse_generic(path, true),
+        _ => parse_generic(path, false),
+    }
+}
+
+fn json_lines(path: &Path) -> Result<Vec<Value>, String> {
+    let file =
+        fs::File::open(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let mut values = Vec::new();
+    for (index, line) in BufReader::new(file).lines().enumerate() {
+        let line = line.map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value = serde_json::from_str(&line).map_err(|error| {
+            format!("invalid JSON at {}:{}: {error}", path.display(), index + 1)
+        })?;
+        values.push(value);
+    }
+    Ok(values)
+}
+
+fn parse_claude(path: &Path) -> Result<UsageRecord, String> {
+    let mut model = None;
+    let mut usage = TokenUsage::default();
+    let mut seen = HashSet::new();
+    for value in json_lines(path)? {
+        let Some(message) = value.get("message").and_then(Value::as_object) else {
+            continue;
+        };
+        let Some(raw_usage) = message.get("usage").and_then(Value::as_object) else {
+            continue;
+        };
+        if let Some(found) = message.get("model").and_then(Value::as_str) {
+            model = Some(found.to_owned());
+        }
+        let identity = message
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| serde_json::to_string(raw_usage).unwrap_or_default());
+        if seen.insert(identity) {
+            usage.add_assign(usage_from(raw_usage, false));
+        }
+    }
+    finish(model, usage)
+}
+
+fn parse_codex(path: &Path) -> Result<UsageRecord, String> {
+    let mut model = None;
+    let mut usage = TokenUsage::default();
+    for value in json_lines(path)? {
+        let payload = value.get("payload").unwrap_or(&value);
+        if let Some(found) = find_string(payload, &["model", "model_id", "modelID"]) {
+            model = Some(found.to_owned());
+        }
+        if payload.get("type").and_then(Value::as_str) == Some("token_count")
+            && let Some(total) = payload
+                .pointer("/info/total_token_usage")
+                .and_then(Value::as_object)
+        {
+            usage = usage_from(total, true);
+        }
+    }
+    finish(model, usage)
+}
+
+fn parse_generic(path: &Path, cached_is_subset: bool) -> Result<UsageRecord, String> {
+    let mut model = None;
+    let mut usage = TokenUsage::default();
+    let mut seen = HashSet::new();
+    if path
+        .extension()
+        .is_some_and(|extension| extension == "jsonl")
+    {
+        let file = fs::File::open(path)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        for (index, line) in BufReader::new(file).lines().enumerate() {
+            let line = line.map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: Value = serde_json::from_str(&line).map_err(|error| {
+                format!("invalid JSON at {}:{}: {error}", path.display(), index + 1)
+            })?;
+            collect(&value, &mut model, &mut usage, &mut seen, cached_is_subset);
+        }
+    } else {
+        let bytes =
+            fs::read(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        let value: Value = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("invalid JSON in {}: {error}", path.display()))?;
+        collect(&value, &mut model, &mut usage, &mut seen, cached_is_subset);
+    }
+    finish(model, usage)
+}
+
+fn collect(
+    value: &Value,
+    model: &mut Option<String>,
+    total: &mut TokenUsage,
+    seen: &mut HashSet<String>,
+    cached_is_subset: bool,
+) {
+    match value {
+        Value::Object(object) => {
+            if let Some(found) = find_string(value, &["model", "model_id", "modelID"]) {
+                *model = Some(found.to_owned());
+            }
+            let usage_object = object
+                .get("usage")
+                .and_then(Value::as_object)
+                .or_else(|| object.get("usageMetadata").and_then(Value::as_object))
+                .or_else(|| object.get("tokenUsage").and_then(Value::as_object));
+            if let Some(raw) = usage_object {
+                let should_count = object
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_none_or(|identity| seen.insert(identity.to_owned()));
+                if should_count {
+                    total.add_assign(usage_from(raw, cached_is_subset));
+                }
+                return;
+            }
+            for child in object.values() {
+                collect(child, model, total, seen, cached_is_subset);
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                collect(child, model, total, seen, cached_is_subset);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn usage_from(object: &Map<String, Value>, cached_is_subset: bool) -> TokenUsage {
+    let raw_input = number(
+        object,
+        &[
+            "input",
+            "input_tokens",
+            "inputTokens",
+            "prompt_tokens",
+            "promptTokenCount",
+        ],
+    );
+    let cache_read = number(
+        object,
+        &[
+            "cacheRead",
+            "cache_read_input_tokens",
+            "cached_input_tokens",
+            "cacheReadInputTokens",
+            "cachedContentTokenCount",
+        ],
+    );
+    let raw_output = number(
+        object,
+        &[
+            "output",
+            "output_tokens",
+            "outputTokens",
+            "completion_tokens",
+            "candidatesTokenCount",
+        ],
+    );
+    let reasoning = number(
+        object,
+        &[
+            "reasoning_output_tokens",
+            "reasoning_tokens",
+            "thoughtsTokenCount",
+        ],
+    );
+    TokenUsage {
+        input: if cached_is_subset {
+            raw_input.saturating_sub(cache_read)
+        } else {
+            raw_input
+        },
+        output: raw_output.saturating_sub(reasoning),
+        cache_read,
+        cache_write: number(
+            object,
+            &[
+                "cacheWrite",
+                "cache_creation_input_tokens",
+                "cache_write_input_tokens",
+                "cacheWriteInputTokens",
+            ],
+        ),
+        reasoning,
+    }
+}
+
+fn number(object: &Map<String, Value>, keys: &[&str]) -> u64 {
+    keys.iter()
+        .find_map(|key| object.get(*key).and_then(Value::as_u64))
+        .unwrap_or(0)
+}
+
+fn find_string<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    let object = value.as_object()?;
+    keys.iter()
+        .find_map(|key| object.get(*key).and_then(Value::as_str))
+}
+
+fn finish(model: Option<String>, usage: TokenUsage) -> Result<UsageRecord, String> {
+    let model = model.ok_or_else(|| "session contains usage but no model identifier".to_owned())?;
+    if usage.is_empty() {
+        return Err("session contains no token usage".to_owned());
+    }
+    Ok(UsageRecord { model, usage })
+}
+
+fn parse_sqlite(path: &Path) -> Result<UsageRecord, String> {
+    let connection = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+    let mut statement = connection
+        .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+        .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+    let tables: Vec<String> = statement
+        .query_map([], |row| row.get(0))
+        .map_err(|e| e.to_string())?
+        .filter_map(Result::ok)
+        .collect();
+    let mut values = Vec::new();
+    for table in tables {
+        let escaped = table.replace('"', "\"\"");
+        let pragma = format!("PRAGMA table_info(\"{escaped}\")");
+        let mut columns = connection.prepare(&pragma).map_err(|e| e.to_string())?;
+        let text_columns: Vec<String> = columns
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| e.to_string())?
+            .filter_map(Result::ok)
+            .collect();
+        for column in text_columns {
+            let column = column.replace('"', "\"\"");
+            let query = format!(
+                "SELECT \"{column}\" FROM \"{escaped}\" WHERE typeof(\"{column}\")='text' AND (\"{column}\" LIKE '{{%' OR \"{column}\" LIKE '[%')"
+            );
+            if let Ok(mut rows) = connection.prepare(&query)
+                && let Ok(iter) = rows.query_map([], |row| row.get::<_, String>(0))
+            {
+                values.extend(
+                    iter.filter_map(Result::ok)
+                        .filter_map(|text| serde_json::from_str(&text).ok()),
+                );
+            }
+        }
+    }
+    let mut model = None;
+    let mut usage = TokenUsage::default();
+    let mut seen = HashSet::new();
+    for value in &values {
+        collect(value, &mut model, &mut usage, &mut seen, false);
+    }
+    finish(model, usage)
+}
