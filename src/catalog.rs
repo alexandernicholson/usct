@@ -61,21 +61,31 @@ impl PricingCatalog for ModelsDevCatalog {
         let qualified = requested.split_once('/');
         let model = qualified.map_or(requested, |(_, model)| model);
         let provider = qualified.map(|(provider, _)| provider);
+        let provider_alias =
+            provider.and_then(|provider| (provider == "openai-codex").then_some("openai"));
 
-        self.providers.iter().find_map(|(provider_id, entry)| {
-            if provider.is_some_and(|wanted| wanted != provider_id) {
-                return None;
+        for wanted_provider in std::iter::once(provider).chain(provider_alias.map(Some)) {
+            for wanted_model in std::iter::once(model).chain(model.strip_suffix("-sol")) {
+                let price = self.providers.iter().find_map(|(provider_id, entry)| {
+                    if wanted_provider.is_some_and(|wanted| wanted != provider_id) {
+                        return None;
+                    }
+                    entry.models.iter().find_map(|(key, candidate)| {
+                        let exact = key == wanted_model || candidate.id == wanted_model;
+                        let normalized = normalize(key) == normalize(wanted_model)
+                            || normalize(&candidate.id) == normalize(wanted_model);
+                        (exact || normalized)
+                            .then_some(candidate.cost.as_ref())
+                            .flatten()
+                            .map(to_price)
+                    })
+                });
+                if price.is_some() {
+                    return price;
+                }
             }
-            entry.models.iter().find_map(|(key, candidate)| {
-                let exact = key == model || candidate.id == model;
-                let normalized = normalize(key) == normalize(model)
-                    || normalize(&candidate.id) == normalize(model);
-                (exact || normalized)
-                    .then_some(candidate.cost.as_ref())
-                    .flatten()
-                    .map(to_price)
-            })
-        })
+        }
+        None
     }
 }
 

@@ -342,6 +342,7 @@ The same bare model ID can appear under multiple models.dev providers. USCT uses
 - Gemini CLI defaults to Google.
 
 A provider-qualified model ID in a transcript takes precedence over inference.
+OMP's `openai-codex` provider ID is matched to the OpenAI catalog. If an OMP `-sol` model variant has no exact catalog entry, USCT uses the corresponding base model; exact entries always take precedence.
 
 ## Cache behavior
 

@@ -36,6 +36,25 @@ fn models_dev_lookup_accepts_provider_qualified_and_bare_ids() {
 }
 
 #[test]
+fn models_dev_lookup_resolves_omp_model_aliases() {
+    let json =
+        r#"{"openai":{"models":{"gpt-5.6":{"id":"gpt-5.6","cost":{"input":5,"output":30}}}}}"#;
+    let catalog = ModelsDevCatalog::from_slice(json.as_bytes()).unwrap();
+    assert_eq!(catalog.find("openai/gpt-5.6-sol").unwrap().input, 5.0);
+    assert_eq!(
+        catalog.find("openai-codex/gpt-5.6-sol").unwrap().output,
+        30.0
+    );
+    assert!(catalog.find("openai/gpt-5.6-codex").is_none());
+
+    let exact = ModelsDevCatalog::from_slice(
+        br#"{"openai":{"models":{"gpt-5.6":{"id":"gpt-5.6","cost":{"input":5,"output":30}},"gpt-5.6-sol":{"id":"gpt-5.6-sol","cost":{"input":7,"output":42}}}}}"#,
+    )
+    .unwrap();
+    assert_eq!(exact.find("openai/gpt-5.6-sol").unwrap().input, 7.0);
+}
+
+#[test]
 fn claude_parser_sums_unique_assistant_usage() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("session.jsonl");
