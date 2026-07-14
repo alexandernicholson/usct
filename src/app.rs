@@ -1,6 +1,6 @@
 use crate::{
     catalog::ModelsDevCatalog,
-    domain::{Price, UsageRecord},
+    domain::{PricedModelUsage, TokenUsage, UsageRecord},
     session::{Harness, parse_session_in_range},
     time_range::TimeRange,
 };
@@ -10,8 +10,8 @@ use std::path::Path;
 pub struct CostReport {
     pub harness: Harness,
     pub path: String,
-    pub record: UsageRecord,
-    pub price: Price,
+    pub models: Vec<PricedModelUsage>,
+    pub usage: TokenUsage,
     pub cost: f64,
 }
 
@@ -39,19 +39,28 @@ pub fn price_record(
     catalog: &ModelsDevCatalog,
     record: UsageRecord,
 ) -> Result<CostReport, String> {
-    let pricing_id = pricing_id(harness, &record.model);
-    let price = catalog.find(&pricing_id).ok_or_else(|| {
-        format!(
-            "model '{}' is absent from the models.dev cache",
-            record.model
-        )
-    })?;
-    let cost = price.cost(record.usage);
+    let usage = record.usage();
+    let mut cost = 0.0;
+    let mut models = Vec::with_capacity(record.models.len());
+    for item in record.models {
+        let pricing_id = pricing_id(harness, &item.model);
+        let price = catalog
+            .find(&pricing_id)
+            .ok_or_else(|| format!("model '{}' is absent from the models.dev cache", item.model))?;
+        let cost_usd = price.cost(item.usage);
+        cost += cost_usd;
+        models.push(PricedModelUsage {
+            model: item.model,
+            usage: item.usage,
+            price,
+            cost_usd,
+        });
+    }
     Ok(CostReport {
         harness,
         path: path.display().to_string(),
-        record,
-        price,
+        models,
+        usage,
         cost,
     })
 }
@@ -82,7 +91,7 @@ pub fn calculate_many(
         if !sources.contains(&source) {
             sources.push(source);
         }
-        usage.add_assign(report.record.usage);
+        usage.add_assign(report.usage);
         cost += report.cost;
         session_count += 1;
     }

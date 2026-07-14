@@ -307,6 +307,8 @@ models.dev prices are denominated in USD per one million tokens. USCT calculates
  / 1,000,000
 ```
 
+USCT keeps a separate usage bucket for every model observed in a session, applies that model's price to its bucket, and sums the resulting costs. A mid-session model change therefore affects only usage recorded after the change.
+
 When an optional models.dev price is absent:
 
 - cache-read tokens use the ordinary input price;
@@ -324,7 +326,7 @@ Token schemas differ between harnesses:
 
 USCT normalizes these differences before pricing:
 
-- Codex uses the final cumulative `total_token_usage` snapshot in a transcript.
+- Codex converts each cumulative `total_token_usage` snapshot into a delta and attributes that delta to the model active for the interval.
 - Cached input is subtracted from aggregate input only for formats where it is a subset.
 - Reasoning is subtracted from output when separately reported.
 - Claude assistant messages are deduplicated by message ID.
@@ -350,7 +352,7 @@ Likewise, a model revision ending in a valid `YYYY-MM-DD` date uses the correspo
 
 USCT maintains two cache layers beside `models.json`:
 
-1. **Per-session reports** store the normalized token usage and calculated cost for an unchanged transcript.
+1. **Per-session reports** store normalized per-model usage, resolved prices, and the calculated cost for an unchanged transcript.
 2. **Scope aggregates** store the rendered inputs for scopes such as all providers, one source, or an explicit session.
 
 Cache validation includes:
@@ -372,16 +374,16 @@ This lets USCT bypass recursive discovery on an unchanged warm run while still i
 
 When one transcript changes, unchanged transcript contributions are reused directly from the aggregate state.
 
-Aggregate states retain every session's normalized contribution, resolved model price, fingerprint, and parser progress. When one session changes, USCT subtracts its prior contribution and adds the updated contribution; unchanged sessions are reused directly from the aggregate state. Ordinary appends therefore avoid recursive discovery, per-session cache reads, and models.dev JSON decoding.
+Aggregate states retain every session's normalized per-model contributions, resolved model prices, fingerprint, and parser progress. When one session changes, USCT subtracts its prior contribution and adds the updated contribution; unchanged sessions are reused directly from the aggregate state. Ordinary appends therefore avoid recursive discovery, per-session cache reads, and models.dev JSON decoding.
 
 For append-only JSONL transcripts, USCT also persists source-specific parser progress:
 
 - the byte offset of the last complete JSONL record;
 - a hash of the trailing parsed bytes;
 - filesystem identity for replacement detection;
-- accumulated normalized usage;
-- model and message-ID deduplication state;
-- the Codex cumulative baseline;
+- accumulated normalized per-model usage;
+- active-model and message-ID deduplication state;
+- the previous Codex cumulative snapshot;
 - effective time-range boundaries.
 
 When an active harness appends a record, USCT seeks directly to the prior byte offset and parses only complete newly appended records. A partial trailing JSONL record is deferred until a later append supplies its terminating newline. Truncation, replacement, changed file identity, or a mismatching tail hash triggers a safe full rebuild.

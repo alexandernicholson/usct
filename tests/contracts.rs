@@ -3,10 +3,19 @@ use tempfile::tempdir;
 use usct::{
     app, cache,
     catalog::ModelsDevCatalog,
-    domain::{Price, TokenUsage},
+    domain::{Price, PricedModelUsage, TokenUsage},
     session::{Harness, parse_session, parse_session_in_range, parse_session_incremental},
     time_range::{Period, custom_range},
 };
+
+fn priced_model(model: &str, usage: TokenUsage, price: Price) -> PricedModelUsage {
+    PricedModelUsage {
+        model: model.to_owned(),
+        usage,
+        price,
+        cost_usd: price.cost(usage),
+    }
+}
 
 #[test]
 fn prices_distinct_token_classes_without_double_counting_cache() {
@@ -87,10 +96,10 @@ fn claude_parser_sums_unique_assistant_usage() {
         "{\"type\":\"assistant\",\"message\":{\"id\":\"b\",\"model\":\"claude-sonnet-4\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}}\n"
     )).unwrap();
     let record = parse_session(Harness::Claude, &path).unwrap();
-    assert_eq!(record.model, "claude-sonnet-4");
-    assert_eq!(record.usage.input, 105);
-    assert_eq!(record.usage.output, 23);
-    assert_eq!(record.usage.cache_read, 50);
+    assert_eq!(record.models[0].model, "claude-sonnet-4");
+    assert_eq!(record.usage().input, 105);
+    assert_eq!(record.usage().output, 23);
+    assert_eq!(record.usage().cache_read, 50);
 }
 
 #[test]
@@ -106,9 +115,9 @@ fn claude_parser_ignores_synthetic_assistant_messages() {
     )
     .unwrap();
     let record = parse_session(Harness::Claude, &path).unwrap();
-    assert_eq!(record.model, "claude-test");
-    assert_eq!(record.usage.input, 100);
-    assert_eq!(record.usage.output, 10);
+    assert_eq!(record.models[0].model, "claude-test");
+    assert_eq!(record.usage().input, 100);
+    assert_eq!(record.usage().output, 10);
 
     fs::write(
         &path,
@@ -131,10 +140,70 @@ fn codex_parser_uses_final_cumulative_snapshot() {
         "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":170,\"cached_input_tokens\":60,\"output_tokens\":35,\"reasoning_output_tokens\":8}}}}\n"
     )).unwrap();
     let record = parse_session(Harness::Codex, &path).unwrap();
-    assert_eq!(record.usage.input, 110);
-    assert_eq!(record.usage.cache_read, 60);
-    assert_eq!(record.usage.output, 27);
-    assert_eq!(record.usage.reasoning, 8);
+    assert_eq!(record.usage().input, 110);
+    assert_eq!(record.usage().cache_read, 60);
+    assert_eq!(record.usage().output, 27);
+    assert_eq!(record.usage().reasoning, 8);
+}
+
+#[test]
+fn codex_parser_attributes_deltas_across_model_changes_and_resets() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("rollout.jsonl");
+    fs::write(
+        &path,
+        concat!(
+            "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-a\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":100,\"cached_input_tokens\":0,\"output_tokens\":0}}}}\n",
+            "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-b\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":180,\"cached_input_tokens\":0,\"output_tokens\":0}}}}\n",
+            "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-a\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":20,\"cached_input_tokens\":0,\"output_tokens\":0}}}}\n"
+        ),
+    )
+    .unwrap();
+
+    let record = parse_session(Harness::Codex, &path).unwrap();
+    assert_eq!(record.models.len(), 2);
+    assert_eq!(record.models[0].model, "gpt-a");
+    assert_eq!(record.models[0].usage.input, 120);
+    assert_eq!(record.models[1].model, "gpt-b");
+    assert_eq!(record.models[1].usage.input, 80);
+
+    let (incremental, _) = parse_session_incremental(Harness::Codex, &path, None, None).unwrap();
+    assert_eq!(incremental, record);
+}
+
+#[test]
+fn cli_prices_each_model_segment_at_its_own_rate() {
+    let dir = tempdir().unwrap();
+    let session = dir.path().join("session.jsonl");
+    let models = dir.path().join("models.json");
+    fs::write(
+        &session,
+        concat!(
+            "{\"type\":\"assistant\",\"message\":{\"id\":\"a\",\"model\":\"claude-a\",\"usage\":{\"input_tokens\":1000000,\"output_tokens\":0}}}\n",
+            "{\"type\":\"assistant\",\"message\":{\"id\":\"b\",\"model\":\"claude-b\",\"usage\":{\"input_tokens\":0,\"output_tokens\":1000000}}}\n"
+        ),
+    )
+    .unwrap();
+    fs::write(
+        &models,
+        r#"{"anthropic":{"models":{"claude-a":{"id":"claude-a","cost":{"input":1,"output":2}},"claude-b":{"id":"claude-b","cost":{"input":3,"output":10}}}}}"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_usct"))
+        .args(["--source", "claude", "--session", session.to_str().unwrap()])
+        .env("USCT_MODELS_PATH", &models)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "$11.00\n");
 }
 
 #[test]
@@ -175,16 +244,41 @@ fn generic_harness_parsers_accept_persisted_usage_objects() {
         Harness::Amp,
     ] {
         let record = parse_session(harness, &path).unwrap();
-        assert_eq!(record.model, "shared-test");
+        assert_eq!(record.models[0].model, "shared-test");
         assert_eq!(
-            record.usage.input,
+            record.usage().input,
             if harness == Harness::Gemini { 50 } else { 80 }
         );
-        assert_eq!(record.usage.cache_read, 30);
-        assert_eq!(record.usage.output, 15);
-        assert_eq!(record.usage.reasoning, 5);
-        assert_eq!(record.usage.cache_write, 4);
+        assert_eq!(record.usage().cache_read, 30);
+        assert_eq!(record.usage().output, 15);
+        assert_eq!(record.usage().reasoning, 5);
+        assert_eq!(record.usage().cache_write, 4);
     }
+}
+
+#[test]
+fn omp_model_change_events_select_the_usage_bucket() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("session.jsonl");
+    fs::write(
+        &path,
+        concat!(
+            "{\"type\":\"model_change\",\"model\":\"openai/gpt-a\"}\n",
+            "{\"type\":\"message\",\"id\":\"a\",\"message\":{\"role\":\"assistant\",\"usage\":{\"input\":100,\"output\":10}}}\n",
+            "{\"type\":\"model_change\",\"model\":\"openai/gpt-b\"}\n",
+            "{\"type\":\"message\",\"id\":\"b\",\"message\":{\"role\":\"assistant\",\"usage\":{\"input\":200,\"output\":20}}}\n"
+        ),
+    )
+    .unwrap();
+
+    let full = parse_session(Harness::Omp, &path).unwrap();
+    let (incremental, _) = parse_session_incremental(Harness::Omp, &path, None, None).unwrap();
+    assert_eq!(incremental, full);
+    assert_eq!(full.models.len(), 2);
+    assert_eq!(full.models[0].model, "openai/gpt-a");
+    assert_eq!(full.models[0].usage.input, 100);
+    assert_eq!(full.models[1].model, "openai/gpt-b");
+    assert_eq!(full.models[1].usage.input, 200);
 }
 
 #[test]
@@ -198,9 +292,9 @@ fn omp_parser_counts_equal_usage_from_distinct_messages() {
     )
     .unwrap();
     let record = parse_session(Harness::Omp, &path).unwrap();
-    assert_eq!(record.usage.input, 160);
-    assert_eq!(record.usage.output, 40);
-    assert_eq!(record.usage.cache_read, 60);
+    assert_eq!(record.usage().input, 160);
+    assert_eq!(record.usage().output, 40);
+    assert_eq!(record.usage().cache_read, 60);
 }
 
 #[test]
@@ -263,8 +357,8 @@ fn omp_parser_filters_usage_events_by_timestamp() {
     )).unwrap();
     let range = custom_range("2026-07-12T00:00:00Z", Some("2026-07-13T00:00:00Z")).unwrap();
     let record = parse_session_in_range(Harness::Omp, &path, Some(&range)).unwrap();
-    assert_eq!(record.usage.input, 100);
-    assert_eq!(record.usage.output, 30);
+    assert_eq!(record.usage().input, 100);
+    assert_eq!(record.usage().output, 30);
 }
 
 #[test]
@@ -278,9 +372,9 @@ fn codex_range_subtracts_the_cumulative_baseline() {
     )).unwrap();
     let range = custom_range("2026-07-12T00:00:00Z", Some("2026-07-13T00:00:00Z")).unwrap();
     let record = parse_session_in_range(Harness::Codex, &path, Some(&range)).unwrap();
-    assert_eq!(record.usage.input, 50);
-    assert_eq!(record.usage.cache_read, 30);
-    assert_eq!(record.usage.output, 15);
+    assert_eq!(record.usage().input, 50);
+    assert_eq!(record.usage().cache_read, 30);
+    assert_eq!(record.usage().output, 15);
 }
 
 #[test]
@@ -291,7 +385,7 @@ fn incremental_omp_parser_reads_only_appended_records() {
     let second = "{\"type\":\"message\",\"timestamp\":\"2026-07-12T00:01:00Z\",\"message\":{\"role\":\"assistant\",\"model\":\"gpt-test\",\"usage\":{\"input\":50,\"output\":5}}}\n";
     fs::write(&path, first).unwrap();
     let (record, state) = parse_session_incremental(Harness::Omp, &path, None, None).unwrap();
-    assert_eq!(record.usage.input, 100);
+    assert_eq!(record.usage().input, 100);
     fs::OpenOptions::new()
         .append(true)
         .open(&path)
@@ -299,8 +393,8 @@ fn incremental_omp_parser_reads_only_appended_records() {
         .write_all(second.as_bytes())
         .unwrap();
     let (record, _) = parse_session_incremental(Harness::Omp, &path, None, state).unwrap();
-    assert_eq!(record.usage.input, 150);
-    assert_eq!(record.usage.output, 15);
+    assert_eq!(record.usage().input, 150);
+    assert_eq!(record.usage().output, 15);
 }
 
 #[test]
@@ -317,8 +411,8 @@ fn incremental_claude_parser_deduplicates_borrowed_messages() {
     )
     .unwrap();
     let (record, _) = parse_session_incremental(Harness::Claude, &path, None, None).unwrap();
-    assert_eq!(record.usage.input, 150);
-    assert_eq!(record.usage.output, 15);
+    assert_eq!(record.usage().input, 150);
+    assert_eq!(record.usage().output, 15);
 }
 
 #[test]
@@ -334,9 +428,9 @@ fn unknown_codex_records_retain_cumulative_schema_fallback() {
     )
     .unwrap();
     let (record, _) = parse_session_incremental(Harness::Codex, &path, None, None).unwrap();
-    assert_eq!(record.usage.input, 80);
-    assert_eq!(record.usage.cache_read, 20);
-    assert_eq!(record.usage.output, 10);
+    assert_eq!(record.usage().input, 80);
+    assert_eq!(record.usage().cache_read, 20);
+    assert_eq!(record.usage().output, 10);
 }
 
 #[test]
@@ -349,8 +443,8 @@ fn incremental_parser_rebuilds_after_in_place_replacement() {
     let (_, state) = parse_session_incremental(Harness::Omp, &path, None, None).unwrap();
     fs::write(&path, replacement).unwrap();
     let (record, _) = parse_session_incremental(Harness::Omp, &path, None, state).unwrap();
-    assert_eq!(record.usage.input, 900);
-    assert_eq!(record.usage.output, 90);
+    assert_eq!(record.usage().input, 900);
+    assert_eq!(record.usage().output, 90);
 }
 
 #[test]
@@ -365,15 +459,15 @@ fn incremental_codex_parser_updates_the_latest_cumulative_delta() {
     let range = custom_range("2026-07-12T00:00:00Z", None).unwrap();
     let (record, state) =
         parse_session_incremental(Harness::Codex, &path, Some(&range), None).unwrap();
-    assert_eq!(record.usage.input, 50);
+    assert_eq!(record.usage().input, 50);
     fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(
         b"{\"timestamp\":\"2026-07-12T00:02:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":250,\"cached_input_tokens\":70,\"output_tokens\":30}}}}\n"
     ).unwrap();
     let (record, _) =
         parse_session_incremental(Harness::Codex, &path, Some(&range), state).unwrap();
-    assert_eq!(record.usage.input, 100);
-    assert_eq!(record.usage.cache_read, 50);
-    assert_eq!(record.usage.output, 20);
+    assert_eq!(record.usage().input, 100);
+    assert_eq!(record.usage().cache_read, 50);
+    assert_eq!(record.usage().output, 20);
 }
 
 #[test]
@@ -384,7 +478,7 @@ fn incremental_parser_defers_partial_trailing_jsonl_records() {
     let partial = "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"model\":\"gpt-test\",\"usage\":{\"input\":50";
     fs::write(&path, format!("{complete}{partial}")).unwrap();
     let (record, state) = parse_session_incremental(Harness::Omp, &path, None, None).unwrap();
-    assert_eq!(record.usage.input, 100);
+    assert_eq!(record.usage().input, 100);
     fs::OpenOptions::new()
         .append(true)
         .open(&path)
@@ -392,8 +486,8 @@ fn incremental_parser_defers_partial_trailing_jsonl_records() {
         .write_all(b",\"output\":5}}}\n")
         .unwrap();
     let (record, _) = parse_session_incremental(Harness::Omp, &path, None, state).unwrap();
-    assert_eq!(record.usage.input, 150);
-    assert_eq!(record.usage.output, 15);
+    assert_eq!(record.usage().input, 150);
+    assert_eq!(record.usage().output, 15);
 }
 
 #[test]
@@ -415,9 +509,9 @@ fn typed_omp_parser_ignores_large_message_content() {
     });
     fs::write(&path, format!("{line}\n")).unwrap();
     let (record, _) = parse_session_incremental(Harness::Omp, &path, None, None).unwrap();
-    assert_eq!(record.usage.input, 100);
-    assert_eq!(record.usage.output, 10);
-    assert_eq!(record.usage.cache_read, 20);
+    assert_eq!(record.usage().input, 100);
+    assert_eq!(record.usage().output, 10);
+    assert_eq!(record.usage().cache_read, 20);
 }
 
 #[test]
@@ -433,8 +527,8 @@ fn typed_omp_parser_preserves_nested_response_usage() {
     )
     .unwrap();
     let (record, _) = parse_session_incremental(Harness::Omp, &path, None, None).unwrap();
-    assert_eq!(record.usage.input, 150);
-    assert_eq!(record.usage.output, 9);
+    assert_eq!(record.usage().input, 150);
+    assert_eq!(record.usage().output, 9);
 }
 
 #[test]
@@ -447,8 +541,8 @@ fn unknown_omp_records_retain_recursive_schema_fallback() {
     )
     .unwrap();
     let (record, _) = parse_session_incremental(Harness::Omp, &path, None, None).unwrap();
-    assert_eq!(record.usage.input, 70);
-    assert_eq!(record.usage.output, 7);
+    assert_eq!(record.usage().input, 70);
+    assert_eq!(record.usage().output, 7);
 }
 
 #[test]
@@ -475,9 +569,8 @@ fn aggregate_cache_reuses_only_unchanged_contributions() {
     let first_session = cache::CachedSession::new(
         cache::SessionData {
             source: "omp".to_owned(),
-            model: "gpt-test".to_owned(),
+            models: vec![priced_model("gpt-test", usage, price)],
             usage,
-            price,
             cost_usd: price.cost(usage),
             progress: None,
         },
@@ -488,9 +581,8 @@ fn aggregate_cache_reuses_only_unchanged_contributions() {
     let second_session = cache::CachedSession::new(
         cache::SessionData {
             source: "omp".to_owned(),
-            model: "gpt-test".to_owned(),
+            models: vec![priced_model("gpt-test", usage, price)],
             usage,
-            price,
             cost_usd: price.cost(usage),
             progress: None,
         },
@@ -522,8 +614,8 @@ fn aggregate_cache_reuses_only_unchanged_contributions() {
     assert!(stale.reusable_contribution(&first).is_some());
     assert!(stale.reusable_contribution(&second).is_none());
     let previous = stale.contribution(&second).unwrap();
-    assert_eq!(previous.model, "gpt-test");
-    assert_eq!(previous.price, price);
+    assert_eq!(previous.models[0].model, "gpt-test");
+    assert_eq!(previous.models[0].price, price);
 }
 
 #[test]
@@ -543,9 +635,8 @@ fn catalog_change_invalidates_resolved_contribution_prices() {
     let cached = cache::CachedSession::new(
         cache::SessionData {
             source: "omp".to_owned(),
-            model: "gpt-test".to_owned(),
+            models: vec![priced_model("gpt-test", TokenUsage::default(), price)],
             usage: TokenUsage::default(),
-            price,
             cost_usd: 0.0,
             progress: None,
         },

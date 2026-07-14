@@ -1,5 +1,5 @@
 use crate::{
-    domain::{TokenUsage, UsageRecord},
+    domain::{ModelUsage, TokenUsage, UsageRecord},
     time_range::{TimeRange, parse_timestamp},
 };
 use rusqlite::Connection;
@@ -78,6 +78,36 @@ pub fn parse_session_in_range(
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct UsageAccumulator {
+    active_model: Option<String>,
+    models: Vec<ModelUsage>,
+    unattributed: TokenUsage,
+}
+
+impl UsageAccumulator {
+    fn set_model(&mut self, model: &str) {
+        if self.active_model.as_deref() != Some(model) {
+            self.active_model = Some(model.to_owned());
+        }
+        if !self.unattributed.is_empty() {
+            ModelUsage::add_to(
+                &mut self.models,
+                model,
+                std::mem::take(&mut self.unattributed),
+            );
+        }
+    }
+
+    fn add_usage(&mut self, usage: TokenUsage) {
+        if let Some(model) = self.active_model.as_deref() {
+            ModelUsage::add_to(&mut self.models, model, usage);
+        } else {
+            self.unattributed.add_assign(usage);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParserProgress {
     version: u8,
@@ -85,10 +115,9 @@ pub struct ParserProgress {
     identity: u128,
     offset: u64,
     tail_hash: u64,
-    model: Option<String>,
-    usage: TokenUsage,
+    attribution: UsageAccumulator,
     seen_ids: HashSet<String>,
-    codex_baseline: TokenUsage,
+    codex_previous: TokenUsage,
     range_start_ms: Option<i64>,
     range_end_ms: Option<i64>,
 }
@@ -248,7 +277,7 @@ pub fn parse_session_incremental(
     let range_end_ms = range.and_then(|range| range.end_ms);
     let mut state = previous
         .filter(|state| {
-            state.version == 1
+            state.version == 2
                 && state.harness == harness.name()
                 && state.identity == identity
                 && state.offset <= metadata.len()
@@ -257,15 +286,14 @@ pub fn parse_session_incremental(
                 && tail_hash(path, state.offset).is_some_and(|hash| hash == state.tail_hash)
         })
         .unwrap_or_else(|| ParserProgress {
-            version: 1,
+            version: 2,
             harness: harness.name().to_owned(),
             identity,
             offset: 0,
             tail_hash: 0,
-            model: None,
-            usage: TokenUsage::default(),
+            attribution: UsageAccumulator::default(),
             seen_ids: HashSet::new(),
-            codex_baseline: TokenUsage::default(),
+            codex_previous: TokenUsage::default(),
             range_start_ms,
             range_end_ms,
         });
@@ -305,7 +333,10 @@ pub fn parse_session_incremental(
         }
     }
     state.tail_hash = tail_hash(path, state.offset).unwrap_or(0);
-    let record = finish(state.model.clone(), state.usage)?;
+    let record = finish(
+        state.attribution.models.clone(),
+        state.attribution.unattributed,
+    )?;
     Ok((record, Some(state)))
 }
 
@@ -353,7 +384,7 @@ fn process_typed_claude(
         return true;
     }
     if let Some(model) = message.model {
-        state.model = Some(model.to_owned());
+        state.attribution.set_model(model);
     }
     let Some(usage) = message.usage else {
         return known_shape || !contains_usage_key(line);
@@ -370,7 +401,7 @@ fn process_typed_claude(
         .id
         .is_none_or(|identity| state.seen_ids.insert(identity.to_owned()));
     if should_count {
-        state.usage.add_assign(usage.normalized(false));
+        state.attribution.add_usage(usage.normalized(false));
     }
     true
 }
@@ -387,7 +418,7 @@ fn process_typed_codex(line: &[u8], range: Option<&TimeRange>, state: &mut Parse
         return known_shape || !contains_usage_key(line);
     };
     if let Some(model) = payload.model {
-        state.model = Some(model.to_owned());
+        state.attribution.set_model(model);
     }
     if payload.kind != Some("token_count") {
         return known_shape || !contains_usage_key(line);
@@ -403,12 +434,10 @@ fn process_typed_codex(line: &[u8], range: Option<&TimeRange>, state: &mut Parse
         .timestamp
         .as_ref()
         .and_then(JsonTimestamp::milliseconds);
-    if let Some(range) = range
-        && timestamp.is_some_and(|time| time < range.start_ms)
-    {
-        state.codex_baseline = snapshot;
-    } else if range.is_none_or(|range| timestamp.is_some_and(|time| range.contains(time))) {
-        state.usage = snapshot.saturating_sub(state.codex_baseline);
+    let delta = snapshot.delta_from(state.codex_previous);
+    state.codex_previous = snapshot;
+    if range.is_none_or(|range| timestamp.is_some_and(|time| range.contains(time))) {
+        state.attribution.add_usage(delta);
     }
     true
 }
@@ -418,7 +447,7 @@ fn process_typed_omp(line: &[u8], range: Option<&TimeRange>, state: &mut ParserP
         return false;
     };
     if let Some(model) = envelope.model {
-        state.model = Some(model.to_owned());
+        state.attribution.set_model(model);
     }
     let known_shape = matches!(
         envelope.kind,
@@ -438,7 +467,7 @@ fn process_typed_omp(line: &[u8], range: Option<&TimeRange>, state: &mut ParserP
         return known_shape || !contains_usage_key(line);
     };
     if let Some(model) = message.model {
-        state.model = Some(model.to_owned());
+        state.attribution.set_model(model);
     }
     let timestamp = envelope
         .timestamp
@@ -452,7 +481,7 @@ fn process_typed_omp(line: &[u8], range: Option<&TimeRange>, state: &mut ParserP
         && let Some(usage) = response.usage
     {
         if let Some(model) = response.model {
-            state.model = Some(model.to_owned());
+            state.attribution.set_model(model);
         }
         usage
     } else {
@@ -463,7 +492,7 @@ fn process_typed_omp(line: &[u8], range: Option<&TimeRange>, state: &mut ParserP
     }
     let should_count = identity.is_none_or(|identity| state.seen_ids.insert(identity.to_owned()));
     if should_count {
-        state.usage.add_assign(usage.normalized(false));
+        state.attribution.add_usage(usage.normalized(false));
     }
     true
 }
@@ -490,8 +519,11 @@ fn process_incremental_value(
             let Some(message) = value.get("message").and_then(Value::as_object) else {
                 return;
             };
+            if message.get("model").and_then(Value::as_str) == Some("<synthetic>") {
+                return;
+            }
             if let Some(model) = message.get("model").and_then(Value::as_str) {
-                state.model = Some(model.to_owned());
+                state.attribution.set_model(model);
             }
             let Some(raw_usage) = message.get("usage").and_then(Value::as_object) else {
                 return;
@@ -504,13 +536,13 @@ fn process_incremental_value(
                 .and_then(Value::as_str)
                 .is_none_or(|identity| state.seen_ids.insert(identity.to_owned()));
             if should_count {
-                state.usage.add_assign(usage_from(raw_usage, false));
+                state.attribution.add_usage(usage_from(raw_usage, false));
             }
         }
         Harness::Codex => {
             let payload = value.get("payload").unwrap_or(value);
             if let Some(model) = find_string(payload, &["model", "model_id", "modelID"]) {
-                state.model = Some(model.to_owned());
+                state.attribution.set_model(model);
             }
             if payload.get("type").and_then(Value::as_str) != Some("token_count") {
                 return;
@@ -522,20 +554,17 @@ fn process_incremental_value(
                 return;
             };
             let snapshot = usage_from(total, true);
-            if range.is_some()
-                && timestamp_ms(value).is_some_and(|time| time < range.unwrap().start_ms)
-            {
-                state.codex_baseline = snapshot;
-            } else if value_in_range(value, range) {
-                state.usage = snapshot.saturating_sub(state.codex_baseline);
+            let delta = snapshot.delta_from(state.codex_previous);
+            state.codex_previous = snapshot;
+            if value_in_range(value, range) {
+                state.attribution.add_usage(delta);
             }
         }
         _ => {
             let cached_is_subset = harness == Harness::Gemini;
             collect(
                 value,
-                &mut state.model,
-                &mut state.usage,
+                &mut state.attribution,
                 &mut state.seen_ids,
                 cached_is_subset,
                 range,
@@ -592,8 +621,7 @@ fn json_lines(path: &Path) -> Result<Vec<Value>, String> {
 }
 
 fn parse_claude(path: &Path, range: Option<&TimeRange>) -> Result<UsageRecord, String> {
-    let mut model = None;
-    let mut usage = TokenUsage::default();
+    let mut attribution = UsageAccumulator::default();
     let mut seen = HashSet::new();
     for value in json_lines(path)? {
         let Some(message) = value.get("message").and_then(Value::as_object) else {
@@ -605,8 +633,8 @@ fn parse_claude(path: &Path, range: Option<&TimeRange>) -> Result<UsageRecord, S
         let Some(raw_usage) = message.get("usage").and_then(Value::as_object) else {
             continue;
         };
-        if let Some(found) = message.get("model").and_then(Value::as_str) {
-            model = Some(found.to_owned());
+        if let Some(model) = message.get("model").and_then(Value::as_str) {
+            attribution.set_model(model);
         }
         if !value_in_range(&value, range) {
             continue;
@@ -617,20 +645,19 @@ fn parse_claude(path: &Path, range: Option<&TimeRange>) -> Result<UsageRecord, S
             .map(str::to_owned)
             .unwrap_or_else(|| serde_json::to_string(raw_usage).unwrap_or_default());
         if seen.insert(identity) {
-            usage.add_assign(usage_from(raw_usage, false));
+            attribution.add_usage(usage_from(raw_usage, false));
         }
     }
-    finish(model, usage)
+    finish(attribution.models, attribution.unattributed)
 }
 
 fn parse_codex(path: &Path, range: Option<&TimeRange>) -> Result<UsageRecord, String> {
-    let mut model = None;
-    let mut baseline = TokenUsage::default();
-    let mut usage = TokenUsage::default();
+    let mut attribution = UsageAccumulator::default();
+    let mut previous = TokenUsage::default();
     for value in json_lines(path)? {
         let payload = value.get("payload").unwrap_or(&value);
-        if let Some(found) = find_string(payload, &["model", "model_id", "modelID"]) {
-            model = Some(found.to_owned());
+        if let Some(model) = find_string(payload, &["model", "model_id", "modelID"]) {
+            attribution.set_model(model);
         }
         if payload.get("type").and_then(Value::as_str) == Some("token_count")
             && let Some(total) = payload
@@ -638,16 +665,14 @@ fn parse_codex(path: &Path, range: Option<&TimeRange>) -> Result<UsageRecord, St
                 .and_then(Value::as_object)
         {
             let snapshot = usage_from(total, true);
-            if range.is_some()
-                && timestamp_ms(&value).is_some_and(|time| time < range.unwrap().start_ms)
-            {
-                baseline = snapshot;
-            } else if value_in_range(&value, range) {
-                usage = snapshot.saturating_sub(baseline);
+            let delta = snapshot.delta_from(previous);
+            previous = snapshot;
+            if value_in_range(&value, range) {
+                attribution.add_usage(delta);
             }
         }
     }
-    finish(model, usage)
+    finish(attribution.models, attribution.unattributed)
 }
 
 fn parse_generic(
@@ -655,8 +680,7 @@ fn parse_generic(
     cached_is_subset: bool,
     range: Option<&TimeRange>,
 ) -> Result<UsageRecord, String> {
-    let mut model = None;
-    let mut usage = TokenUsage::default();
+    let mut attribution = UsageAccumulator::default();
     let mut seen = HashSet::new();
     if path
         .extension()
@@ -674,8 +698,7 @@ fn parse_generic(
             })?;
             collect(
                 &value,
-                &mut model,
-                &mut usage,
+                &mut attribution,
                 &mut seen,
                 cached_is_subset,
                 range,
@@ -689,21 +712,19 @@ fn parse_generic(
             .map_err(|error| format!("invalid JSON in {}: {error}", path.display()))?;
         collect(
             &value,
-            &mut model,
-            &mut usage,
+            &mut attribution,
             &mut seen,
             cached_is_subset,
             range,
             true,
         );
     }
-    finish(model, usage)
+    finish(attribution.models, attribution.unattributed)
 }
 
 fn collect(
     value: &Value,
-    model: &mut Option<String>,
-    total: &mut TokenUsage,
+    attribution: &mut UsageAccumulator,
     seen: &mut HashSet<String>,
     cached_is_subset: bool,
     range: Option<&TimeRange>,
@@ -714,8 +735,8 @@ fn collect(
             let allowed = timestamp_ms(value).map_or(inherited_allowed, |time| {
                 range.is_none_or(|range| range.contains(time))
             });
-            if let Some(found) = find_string(value, &["model", "model_id", "modelID"]) {
-                *model = Some(found.to_owned());
+            if let Some(model) = find_string(value, &["model", "model_id", "modelID"]) {
+                attribution.set_model(model);
             }
             let usage_object = object
                 .get("usage")
@@ -728,20 +749,19 @@ fn collect(
                     .and_then(Value::as_str)
                     .is_none_or(|identity| seen.insert(identity.to_owned()));
                 if allowed && should_count {
-                    total.add_assign(usage_from(raw, cached_is_subset));
+                    attribution.add_usage(usage_from(raw, cached_is_subset));
                 }
                 return;
             }
             for child in object.values() {
-                collect(child, model, total, seen, cached_is_subset, range, allowed);
+                collect(child, attribution, seen, cached_is_subset, range, allowed);
             }
         }
         Value::Array(items) => {
             for child in items {
                 collect(
                     child,
-                    model,
-                    total,
+                    attribution,
                     seen,
                     cached_is_subset,
                     range,
@@ -850,12 +870,20 @@ fn value_in_range(value: &Value, range: Option<&TimeRange>) -> bool {
     range.is_none_or(|range| timestamp_ms(value).is_some_and(|time| range.contains(time)))
 }
 
-fn finish(model: Option<String>, usage: TokenUsage) -> Result<UsageRecord, String> {
-    if usage.is_empty() {
+fn finish(models: Vec<ModelUsage>, unattributed: TokenUsage) -> Result<UsageRecord, String> {
+    let total = TokenUsage::total(
+        models
+            .iter()
+            .map(|item| item.usage)
+            .chain(std::iter::once(unattributed)),
+    );
+    if total.is_empty() {
         return Err("session contains no token usage".to_owned());
     }
-    let model = model.ok_or_else(|| "session contains usage but no model identifier".to_owned())?;
-    Ok(UsageRecord { model, usage })
+    if !unattributed.is_empty() {
+        return Err("session contains usage but no model identifier".to_owned());
+    }
+    Ok(UsageRecord { models })
 }
 
 fn parse_sqlite(path: &Path, range: Option<&TimeRange>) -> Result<UsageRecord, String> {
@@ -894,11 +922,10 @@ fn parse_sqlite(path: &Path, range: Option<&TimeRange>) -> Result<UsageRecord, S
             }
         }
     }
-    let mut model = None;
-    let mut usage = TokenUsage::default();
+    let mut attribution = UsageAccumulator::default();
     let mut seen = HashSet::new();
     for value in &values {
-        collect(value, &mut model, &mut usage, &mut seen, false, range, true);
+        collect(value, &mut attribution, &mut seen, false, range, true);
     }
-    finish(model, usage)
+    finish(attribution.models, attribution.unattributed)
 }

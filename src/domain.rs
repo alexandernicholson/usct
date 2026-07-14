@@ -33,6 +33,51 @@ impl TokenUsage {
     }
 }
 
+impl TokenUsage {
+    pub fn delta_from(self, previous: Self) -> Self {
+        if self.input < previous.input
+            || self.output < previous.output
+            || self.cache_read < previous.cache_read
+            || self.cache_write < previous.cache_write
+            || self.reasoning < previous.reasoning
+        {
+            self
+        } else {
+            self.saturating_sub(previous)
+        }
+    }
+
+    pub fn total(items: impl IntoIterator<Item = Self>) -> Self {
+        let mut total = Self::default();
+        for item in items {
+            total.add_assign(item);
+        }
+        total
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelUsage {
+    pub model: String,
+    pub usage: TokenUsage,
+}
+
+impl ModelUsage {
+    pub fn add_to(models: &mut Vec<Self>, model: &str, usage: TokenUsage) {
+        if usage.is_empty() {
+            return;
+        }
+        if let Some(existing) = models.iter_mut().find(|item| item.model == model) {
+            existing.usage.add_assign(usage);
+        } else {
+            models.push(Self {
+                model: model.to_owned(),
+                usage,
+            });
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Price {
     pub input: f64,
@@ -54,8 +99,21 @@ impl Price {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UsageRecord {
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PricedModelUsage {
     pub model: String,
     pub usage: TokenUsage,
+    pub price: Price,
+    pub cost_usd: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageRecord {
+    pub models: Vec<ModelUsage>,
+}
+
+impl UsageRecord {
+    pub fn usage(&self) -> TokenUsage {
+        TokenUsage::total(self.models.iter().map(|item| item.usage))
+    }
 }

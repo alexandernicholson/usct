@@ -9,6 +9,7 @@ use usct::{
     app, cache,
     catalog::ModelsDevCatalog,
     discovery,
+    domain::{PricedModelUsage, UsageRecord},
     session::{Harness, parse_session_incremental},
     time_range::{Period, TimeRange, custom_range},
 };
@@ -190,31 +191,35 @@ fn calculate_sessions(
                     Err(error) if error == "session contains no token usage" => continue,
                     Err(error) => return Err(format!("{}: {error}", path.display())),
                 };
-            let (price, calculated_cost) =
-                if let Some(prior) = prior.as_ref().filter(|prior| prior.model == record.model) {
-                    (prior.price, prior.price.cost(record.usage))
-                } else {
-                    if catalog.is_none() {
-                        catalog = Some(
-                            ModelsDevCatalog::from_path(catalog_path)
-                                .map_err(|error| format!("{error}; run 'usct update'"))?,
-                        );
-                    }
-                    let report = app::price_record(
-                        *harness,
-                        path,
-                        catalog.as_ref().expect("catalog initialized"),
-                        record.clone(),
-                    )
-                    .map_err(|error| format!("{}: {error}", path.display()))?;
-                    (report.price, report.cost)
-                };
+            let cached_prices = prior.as_ref().filter(|prior| {
+                record
+                    .models
+                    .iter()
+                    .all(|item| prior.models.iter().any(|cached| cached.model == item.model))
+            });
+            let (models, usage, calculated_cost) = if let Some(prior) = cached_prices {
+                price_from_cache(record, prior)
+            } else {
+                if catalog.is_none() {
+                    catalog = Some(
+                        ModelsDevCatalog::from_path(catalog_path)
+                            .map_err(|error| format!("{error}; run 'usct update'"))?,
+                    );
+                }
+                let report = app::price_record(
+                    *harness,
+                    path,
+                    catalog.as_ref().expect("catalog initialized"),
+                    record,
+                )
+                .map_err(|error| format!("{}: {error}", path.display()))?;
+                (report.models, report.usage, report.cost)
+            };
             cache::CachedSession::new(
                 cache::SessionData {
                     source: harness.name().to_owned(),
-                    model: record.model,
-                    usage: record.usage,
-                    price,
+                    models,
+                    usage,
                     cost_usd: calculated_cost,
                     progress,
                 },
@@ -242,6 +247,32 @@ fn calculate_sessions(
         },
         contributions,
     })
+}
+
+fn price_from_cache(
+    record: UsageRecord,
+    prior: &cache::CachedSession,
+) -> (Vec<PricedModelUsage>, usct::domain::TokenUsage, f64) {
+    let usage = record.usage();
+    let mut cost = 0.0;
+    let mut models = Vec::with_capacity(record.models.len());
+    for item in record.models {
+        let price = prior
+            .models
+            .iter()
+            .find(|cached| cached.model == item.model)
+            .expect("cached prices checked")
+            .price;
+        let cost_usd = price.cost(item.usage);
+        cost += cost_usd;
+        models.push(PricedModelUsage {
+            model: item.model,
+            usage: item.usage,
+            price,
+            cost_usd,
+        });
+    }
+    (models, usage, cost)
 }
 
 fn render_report(report: &cache::CachedReport, format: &str) -> Result<String, String> {

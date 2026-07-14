@@ -1,5 +1,5 @@
 use crate::{
-    domain::{Price, TokenUsage},
+    domain::{PricedModelUsage, TokenUsage},
     session::ParserProgress,
     time_range::TimeRange,
 };
@@ -25,9 +25,8 @@ struct FileFingerprint {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedSession {
     pub source: String,
-    pub model: String,
+    pub models: Vec<PricedModelUsage>,
     pub usage: TokenUsage,
-    pub price: Price,
     pub cost_usd: f64,
     pub progress: Option<ParserProgress>,
     version: u8,
@@ -51,7 +50,7 @@ pub fn load_session(path: &Path, range_key: &str, catalog_path: &Path) -> Option
     let cache_path = session_state_path(catalog_path, path, range_key)?;
     let bytes = fs::read(cache_path).ok()?;
     let session: CachedSession = serde_json::from_slice(&bytes).ok()?;
-    (session.version == 4
+    (session.version == 5
         && session.file == fingerprint(path).ok()?
         && session.catalog == fingerprint(catalog_path).ok()?)
     .then_some(session)
@@ -66,9 +65,8 @@ pub fn save_session(session: &CachedSession, path: &Path, range_key: &str, catal
 
 pub struct SessionData {
     pub source: String,
-    pub model: String,
+    pub models: Vec<PricedModelUsage>,
     pub usage: TokenUsage,
-    pub price: Price,
     pub cost_usd: f64,
     pub progress: Option<ParserProgress>,
 }
@@ -77,12 +75,11 @@ impl CachedSession {
     pub fn new(data: SessionData, path: &Path, catalog_path: &Path) -> Result<Self, String> {
         Ok(Self {
             source: data.source,
-            model: data.model,
+            models: data.models,
             usage: data.usage,
-            price: data.price,
             cost_usd: data.cost_usd,
             progress: data.progress,
-            version: 4,
+            version: 5,
             file: fingerprint(path)?,
             catalog: fingerprint(catalog_path)?,
         })
@@ -94,9 +91,8 @@ struct CachedContribution {
     path: String,
     file: FileFingerprint,
     source: String,
-    model: String,
+    models: Vec<PricedModelUsage>,
     usage: TokenUsage,
-    price: Price,
     cost_usd: f64,
     progress: Option<ParserProgress>,
 }
@@ -136,7 +132,7 @@ impl CachedReport {
             usage,
             cost_usd,
             range,
-            version: 8,
+            version: 9,
             files: contributions
                 .iter()
                 .map(|(_, session)| session.file.clone())
@@ -149,9 +145,8 @@ impl CachedReport {
                     path: path.display().to_string(),
                     file: session.file.clone(),
                     source: session.source.clone(),
-                    model: session.model.clone(),
+                    models: session.models.clone(),
                     usage: session.usage,
-                    price: session.price,
                     cost_usd: session.cost_usd,
                     progress: session.progress.clone(),
                 })
@@ -166,12 +161,11 @@ impl CachedReport {
             .find(|contribution| contribution.path == path.display().to_string())?;
         Some(CachedSession {
             source: contribution.source.clone(),
-            model: contribution.model.clone(),
+            models: contribution.models.clone(),
             usage: contribution.usage,
-            price: contribution.price,
             cost_usd: contribution.cost_usd,
             progress: contribution.progress.clone(),
-            version: 4,
+            version: 5,
             file: contribution.file.clone(),
             catalog: self.catalog.clone(),
         })
@@ -201,7 +195,7 @@ pub fn load_report(scope: &str, catalog_path: &Path) -> Option<CachedReport> {
     let path = state_path(catalog_path, scope)?;
     let bytes = fs::read(path).ok()?;
     let report: CachedReport = serde_json::from_slice(&bytes).ok()?;
-    (report.version == 8
+    (report.version == 9
         && report.files == refresh(&report.files).ok()?
         && report.directories == refresh(&report.directories).ok()?
         && report.catalog == fingerprint(catalog_path).ok()?)
@@ -211,7 +205,7 @@ pub fn load_report(scope: &str, catalog_path: &Path) -> Option<CachedReport> {
 pub fn load_stale_report(scope: &str, catalog_path: &Path) -> Option<CachedReport> {
     let path = state_path(catalog_path, scope)?;
     let report: CachedReport = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
-    (report.version == 8 && report.catalog == fingerprint(catalog_path).ok()?).then_some(report)
+    (report.version == 9 && report.catalog == fingerprint(catalog_path).ok()?).then_some(report)
 }
 
 pub fn save_report(report: &CachedReport, scope: &str, catalog_path: &Path) {
