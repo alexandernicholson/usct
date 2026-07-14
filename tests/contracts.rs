@@ -94,6 +94,34 @@ fn claude_parser_sums_unique_assistant_usage() {
 }
 
 #[test]
+fn claude_parser_ignores_synthetic_assistant_messages() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("session.jsonl");
+    fs::write(
+        &path,
+        concat!(
+            "{\"type\":\"assistant\",\"message\":{\"id\":\"a\",\"model\":\"claude-test\",\"usage\":{\"input_tokens\":100,\"output_tokens\":10}}}\n",
+            "{\"type\":\"assistant\",\"message\":{\"id\":\"b\",\"model\":\"<synthetic>\",\"usage\":{\"input_tokens\":999,\"output_tokens\":999}}}\n"
+        ),
+    )
+    .unwrap();
+    let record = parse_session(Harness::Claude, &path).unwrap();
+    assert_eq!(record.model, "claude-test");
+    assert_eq!(record.usage.input, 100);
+    assert_eq!(record.usage.output, 10);
+
+    fs::write(
+        &path,
+        "{\"type\":\"assistant\",\"message\":{\"id\":\"b\",\"model\":\"<synthetic>\",\"usage\":{\"input_tokens\":999,\"output_tokens\":999}}}\n",
+    )
+    .unwrap();
+    assert_eq!(
+        parse_session(Harness::Claude, &path).unwrap_err(),
+        "session contains no token usage"
+    );
+}
+
+#[test]
 fn codex_parser_uses_final_cumulative_snapshot() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("rollout.jsonl");

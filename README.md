@@ -328,6 +328,7 @@ USCT normalizes these differences before pricing:
 - Cached input is subtracted from aggregate input only for formats where it is a subset.
 - Reasoning is subtracted from output when separately reported.
 - Claude assistant messages are deduplicated by message ID.
+- Claude `<synthetic>` assistant records are client-generated placeholders and are excluded from usage and model selection.
 - Distinct OMP messages with identical usage values remain distinct and are both counted.
 
 ### Provider-aware model lookup

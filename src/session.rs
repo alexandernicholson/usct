@@ -349,6 +349,9 @@ fn process_typed_claude(
     let Some(message) = envelope.message else {
         return known_shape || !contains_usage_key(line);
     };
+    if message.model == Some("<synthetic>") {
+        return true;
+    }
     if let Some(model) = message.model {
         state.model = Some(model.to_owned());
     }
@@ -596,6 +599,9 @@ fn parse_claude(path: &Path, range: Option<&TimeRange>) -> Result<UsageRecord, S
         let Some(message) = value.get("message").and_then(Value::as_object) else {
             continue;
         };
+        if message.get("model").and_then(Value::as_str) == Some("<synthetic>") {
+            continue;
+        }
         let Some(raw_usage) = message.get("usage").and_then(Value::as_object) else {
             continue;
         };
@@ -845,10 +851,10 @@ fn value_in_range(value: &Value, range: Option<&TimeRange>) -> bool {
 }
 
 fn finish(model: Option<String>, usage: TokenUsage) -> Result<UsageRecord, String> {
-    let model = model.ok_or_else(|| "session contains usage but no model identifier".to_owned())?;
     if usage.is_empty() {
         return Err("session contains no token usage".to_owned());
     }
+    let model = model.ok_or_else(|| "session contains usage but no model identifier".to_owned())?;
     Ok(UsageRecord { model, usage })
 }
 
