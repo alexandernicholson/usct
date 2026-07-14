@@ -343,6 +343,7 @@ The same bare model ID can appear under multiple models.dev providers. USCT uses
 
 A provider-qualified model ID in a transcript takes precedence over inference.
 OMP's `openai-codex` provider ID is matched to the OpenAI catalog. If an OMP `-sol` model variant has no exact catalog entry, USCT uses the corresponding base model; exact entries always take precedence.
+Likewise, a model revision ending in a valid `YYYY-MM-DD` date uses the corresponding undated catalog entry when no exact dated entry exists.
 
 ## Cache behavior
 

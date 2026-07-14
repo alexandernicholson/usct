@@ -65,7 +65,10 @@ impl PricingCatalog for ModelsDevCatalog {
             provider.and_then(|provider| (provider == "openai-codex").then_some("openai"));
 
         for wanted_provider in std::iter::once(provider).chain(provider_alias.map(Some)) {
-            for wanted_model in std::iter::once(model).chain(model.strip_suffix("-sol")) {
+            for wanted_model in std::iter::once(model)
+                .chain(model.strip_suffix("-sol"))
+                .chain(strip_date_suffix(model))
+            {
                 let price = self.providers.iter().find_map(|(provider_id, entry)| {
                     if wanted_provider.is_some_and(|wanted| wanted != provider_id) {
                         return None;
@@ -87,6 +90,18 @@ impl PricingCatalog for ModelsDevCatalog {
         }
         None
     }
+}
+
+fn strip_date_suffix(model: &str) -> Option<&str> {
+    let separator = model.len().checked_sub(11)?;
+    if model.as_bytes().get(separator) != Some(&b'-') {
+        return None;
+    }
+    let base = model.get(..separator)?;
+    let date = model.get(separator + 1..)?;
+    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .is_ok()
+        .then_some(base)
 }
 
 fn normalize(value: &str) -> String {

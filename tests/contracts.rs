@@ -55,6 +55,29 @@ fn models_dev_lookup_resolves_omp_model_aliases() {
 }
 
 #[test]
+fn models_dev_lookup_resolves_dated_model_revisions() {
+    let json = r#"{"openai":{"models":{"gpt-5.4-mini":{"id":"gpt-5.4-mini","cost":{"input":0.75,"output":4.5}}}}}"#;
+    let catalog = ModelsDevCatalog::from_slice(json.as_bytes()).unwrap();
+    assert_eq!(
+        catalog
+            .find("openai/gpt-5.4-mini-2026-03-17")
+            .unwrap()
+            .output,
+        4.5
+    );
+    assert!(catalog.find("openai/gpt-5.4-mini-2026-02-30").is_none());
+
+    let exact = ModelsDevCatalog::from_slice(
+        br#"{"openai":{"models":{"gpt-5.4-mini":{"id":"gpt-5.4-mini","cost":{"input":0.75,"output":4.5}},"gpt-5.4-mini-2026-03-17":{"id":"gpt-5.4-mini-2026-03-17","cost":{"input":1,"output":6}}}}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        exact.find("openai/gpt-5.4-mini-2026-03-17").unwrap().output,
+        6.0
+    );
+}
+
+#[test]
 fn claude_parser_sums_unique_assistant_usage() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("session.jsonl");
