@@ -1,8 +1,6 @@
-use chrono::{
-    DateTime, Datelike, Duration, Local, LocalResult, NaiveDate, NaiveDateTime, TimeZone, Timelike,
-    Utc,
-};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveDateTime, Timelike, Utc};
 use serde::{Deserialize, Serialize};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimeRange {
@@ -67,26 +65,28 @@ impl Period {
     }
 
     pub fn range(self) -> Result<Option<TimeRange>, String> {
-        let now = Local::now();
+        if matches!(self, Self::All | Self::Session) {
+            return Ok(None);
+        }
+        let (today, current_hour) = local_now()?;
         let (label, date, hour) = match self {
-            Self::All | Self::Session => return Ok(None),
-            Self::Hour => ("hour", now.date_naive(), Some(now.hour())),
-            Self::Day => ("day", now.date_naive(), None),
+            Self::Hour => ("hour", today, Some(current_hour)),
+            Self::Day => ("day", today, None),
             Self::Week => {
-                let date =
-                    now.date_naive() - Duration::days(now.weekday().num_days_from_monday().into());
+                let date = today - Duration::days(today.weekday().num_days_from_monday().into());
                 ("week", date, None)
             }
             Self::Month => (
                 "month",
-                NaiveDate::from_ymd_opt(now.year(), now.month(), 1).expect("valid month"),
+                NaiveDate::from_ymd_opt(today.year(), today.month(), 1).expect("valid month"),
                 None,
             ),
             Self::Year => (
                 "year",
-                NaiveDate::from_ymd_opt(now.year(), 1, 1).expect("valid year"),
+                NaiveDate::from_ymd_opt(today.year(), 1, 1).expect("valid year"),
                 None,
             ),
+            Self::All | Self::Session => unreachable!("handled above"),
         };
         let naive = date
             .and_hms_opt(hour.unwrap_or(0), 0, 0)
@@ -131,10 +131,86 @@ fn parse_boundary(value: &str) -> Result<i64, String> {
     Err(format!("invalid date or RFC 3339 timestamp '{value}'"))
 }
 
+fn local_now() -> Result<(NaiveDate, u32), String> {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("system clock predates Unix epoch: {error}"))?
+        .as_secs();
+    let timestamp = libc::time_t::try_from(seconds)
+        .map_err(|_| "system clock exceeds local time range".to_owned())?;
+    let local = local_tm(timestamp)?;
+    let date = NaiveDate::from_ymd_opt(
+        local.tm_year + 1900,
+        u32::try_from(local.tm_mon + 1).expect("valid local month"),
+        u32::try_from(local.tm_mday).expect("valid local day"),
+    )
+    .ok_or_else(|| "system returned invalid local date".to_owned())?;
+    Ok((
+        date,
+        u32::try_from(local.tm_hour).expect("valid local hour"),
+    ))
+}
+
 fn local_timestamp(value: NaiveDateTime) -> Result<i64, String> {
-    match Local.from_local_datetime(&value) {
-        LocalResult::Single(timestamp) => Ok(timestamp.timestamp_millis()),
-        LocalResult::Ambiguous(earlier, _) => Ok(earlier.timestamp_millis()),
-        LocalResult::None => Err(format!("local time '{value}' does not exist")),
+    let mut earliest: Option<libc::time_t> = None;
+    for is_dst in [0, 1] {
+        let mut local: libc::tm = unsafe { std::mem::zeroed() };
+        local.tm_sec = i32::try_from(value.second()).expect("valid second");
+        local.tm_min = i32::try_from(value.minute()).expect("valid minute");
+        local.tm_hour = i32::try_from(value.hour()).expect("valid hour");
+        local.tm_mday = i32::try_from(value.day()).expect("valid day");
+        local.tm_mon = i32::try_from(value.month0()).expect("valid month");
+        local.tm_year = value.year() - 1900;
+        local.tm_isdst = is_dst;
+        // SAFETY: `local` is initialized, writable, and contains bounded calendar fields.
+        let timestamp = unsafe { libc::mktime(&mut local) };
+        if tm_matches(&local, value) {
+            earliest = Some(earliest.map_or(timestamp, |current| current.min(timestamp)));
+        }
+    }
+    earliest
+        .and_then(|timestamp| timestamp.checked_mul(1000))
+        .ok_or_else(|| format!("local time '{value}' does not exist"))
+}
+
+fn local_tm(timestamp: libc::time_t) -> Result<libc::tm, String> {
+    let mut local: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: both pointers are valid for the duration of the call and do not alias.
+    let result = unsafe { libc::localtime_r(&timestamp, &mut local) };
+    if result.is_null() {
+        Err("cannot resolve current local time".to_owned())
+    } else {
+        Ok(local)
+    }
+}
+
+fn tm_matches(local: &libc::tm, value: NaiveDateTime) -> bool {
+    local.tm_sec == i32::try_from(value.second()).expect("valid second")
+        && local.tm_min == i32::try_from(value.minute()).expect("valid minute")
+        && local.tm_hour == i32::try_from(value.hour()).expect("valid hour")
+        && local.tm_mday == i32::try_from(value.day()).expect("valid day")
+        && local.tm_mon == i32::try_from(value.month0()).expect("valid month")
+        && local.tm_year == value.year() - 1900
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_timestamp_round_trips_calendar_fields() {
+        let value = NaiveDate::from_ymd_opt(2026, 7, 16)
+            .unwrap()
+            .and_hms_opt(12, 34, 56)
+            .unwrap();
+        let timestamp = local_timestamp(value).unwrap() / 1000;
+        assert!(tm_matches(&local_tm(timestamp).unwrap(), value));
+    }
+
+    #[test]
+    fn day_period_starts_at_local_midnight() {
+        let range = Period::Day.range().unwrap().unwrap();
+        let local = local_tm(range.start_ms / 1000).unwrap();
+        assert_eq!((local.tm_hour, local.tm_min, local.tm_sec), (0, 0, 0));
     }
 }
