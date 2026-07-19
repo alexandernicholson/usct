@@ -65,7 +65,7 @@ fn run() -> Result<String, String> {
             return run_blocks(args, Some(Harness::Claude));
         }
         if command == "statusline" {
-            return run_statusline(args);
+            return run_statusline(args, None);
         }
         if let Ok(source) = Harness::from_str(&command) {
             if args.contains(["-h", "--help"]) {
@@ -79,7 +79,7 @@ fn run() -> Result<String, String> {
                     run_grouped(&nested, args, Some(source))
                 }
                 "blocks" if source == Harness::Claude => run_blocks(args, Some(source)),
-                "statusline" if source == Harness::Claude => run_statusline(args),
+                "statusline" => run_statusline(args, Some(source)),
                 _ => Err(format!("unsupported {} command '{nested}'", source.name())),
             };
         }
@@ -600,7 +600,7 @@ fn run_blocks(mut args: Arguments, source: Option<Harness>) -> Result<String, St
     Ok(output)
 }
 
-fn run_statusline(mut args: Arguments) -> Result<String, String> {
+fn run_statusline(mut args: Arguments, fixed_source: Option<Harness>) -> Result<String, String> {
     if args.contains(["-h", "--help"]) {
         return Ok(statusline_help().to_owned());
     }
@@ -668,25 +668,31 @@ fn run_statusline(mut args: Arguments) -> Result<String, String> {
     } else {
         serde_json::from_str(&input).map_err(|error| format!("invalid hook JSON: {error}"))?
     };
+    let default_source = fixed_source.unwrap_or(Harness::Claude);
     let path = hook
         .get("transcript_path")
         .or_else(|| hook.get("transcriptPath"))
         .and_then(Value::as_str)
         .map(PathBuf::from)
         .or_else(|| {
-            discovery::latest(Some(Harness::Claude))
+            discovery::latest(Some(default_source))
                 .ok()
                 .map(|item| item.path)
         })
         .ok_or_else(|| {
-            "hook input has no transcript path and no Claude session was found".to_owned()
+            format!(
+                "hook input has no transcript path and no {} session was found",
+                default_source.name()
+            )
         })?;
+    let source = fixed_source.unwrap_or_else(|| infer_harness(&path));
     let mut cache_hasher = DefaultHasher::new();
     input.hash(&mut cache_hasher);
     visual_burn_rate.hash(&mut cache_hasher);
     cost_source.hash(&mut cache_hasher);
     context_low.hash(&mut cache_hasher);
     context_medium.hash(&mut cache_hasher);
+    source.name().hash(&mut cache_hasher);
     let statusline_key = cache_hasher.finish();
     if cache_enabled
         && let Some(output) = load_statusline_cache(&path, statusline_key, refresh_interval)
@@ -696,7 +702,7 @@ fn run_statusline(mut args: Arguments) -> Result<String, String> {
         }
         return Ok(output);
     }
-    let record = parse_session(Harness::Claude, &path)?;
+    let record = parse_session(source, &path)?;
     let usage = record.usage();
     let reported_cost = hook
         .pointer("/cost/total_cost_usd")
@@ -709,7 +715,7 @@ fn run_statusline(mut args: Arguments) -> Result<String, String> {
     let mut cost = 0.0;
     if needs_calculated {
         for item in record.models {
-            let id = app::pricing_id(Harness::Claude, &item.model);
+            let id = app::pricing_id(source, &item.model);
             let price = if let Some(price) = config
                 .prices
                 .get(&id)
@@ -773,7 +779,8 @@ fn run_statusline(mut args: Arguments) -> Result<String, String> {
     }
     if debug {
         eprintln!(
-            "usct: debug: statusline cache=miss cost_source={cost_source} tokens={} calculated_cost={cost:.12} reported_cost={} path={}",
+            "usct: debug: statusline cache=miss source={} cost_source={cost_source} tokens={} calculated_cost={cost:.12} reported_cost={} path={}",
+            source.name(),
             usage.total_tokens(),
             reported_cost.map_or_else(|| "none".to_owned(), |value| format!("{value:.12}")),
             path.display()
@@ -1072,7 +1079,7 @@ fn blocks_help() -> &'static str {
 }
 
 fn statusline_help() -> &'static str {
-    "USAGE:\n  usct statusline [OPTIONS]\n\n\
+    "USAGE:\n  usct statusline [OPTIONS]\n  usct <SOURCE> statusline [OPTIONS]\n\n\
 Reads hook JSON from stdin and emits a compact cost, token, and context summary.\n\n\
 OPTIONS:\n\
   -B, --visual-burn-rate MODE    off|emoji|text|emoji-text\n\
@@ -1089,14 +1096,14 @@ OPTIONS:\n\
 }
 
 fn source_help(source: Harness) -> String {
+    let extra = if source == Harness::Claude {
+        "\n  blocks\n  statusline"
+    } else {
+        "\n  statusline"
+    };
     format!(
-        "USAGE:\n  usct {} <COMMAND> [OPTIONS]\n\nCOMMANDS:\n  daily\n  weekly\n  monthly\n  session{}\n\nRun 'usct {} <COMMAND> --help' for command options.",
+        "USAGE:\n  usct {} <COMMAND> [OPTIONS]\n\nCOMMANDS:\n  daily\n  weekly\n  monthly\n  session{extra}\n\nRun 'usct {} <COMMAND> --help' for command options.",
         source.name(),
-        if source == Harness::Claude {
-            "\n  blocks\n  statusline"
-        } else {
-            ""
-        },
         source.name()
     )
 }

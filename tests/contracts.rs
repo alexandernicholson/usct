@@ -989,6 +989,57 @@ fn statusline_accepts_reported_cost_and_visual_burn_options() {
 }
 
 #[test]
+fn omp_statusline_uses_the_omp_parser() {
+    let dir = tempdir().unwrap();
+    let session = dir.path().join("session.jsonl");
+    let config = dir.path().join("config.json");
+    fs::write(
+        &session,
+        concat!(
+            "{\"type\":\"model_change\",\"model\":\"openai/gpt-test\"}\n",
+            "{\"type\":\"message\",\"id\":\"m1\",\"message\":{\"role\":\"assistant\",\"details\":{\"response\":{\"usage\":{\"input\":100,\"output\":10}}}}}\n"
+        ),
+    )
+    .unwrap();
+    fs::write(
+        &config,
+        r#"{"prices":{"openai/gpt-test":{"input":1.0,"output":2.0}}}"#,
+    )
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_usct"))
+        .args([
+            "omp",
+            "statusline",
+            "--config",
+            config.to_str().unwrap(),
+            "--no-cache",
+            "--cost-source",
+            "calculated",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    write!(
+        child.stdin.take().unwrap(),
+        "{{\"transcript_path\":{},\"context_window\":{{\"used_percentage\":25}}}}",
+        serde_json::to_string(session.to_str().unwrap()).unwrap()
+    )
+    .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "$0.0001 · 110 · 25% context\n"
+    );
+}
+
+#[test]
 fn grouped_custom_prices_work_without_a_catalog_and_apply_fast_tier() {
     let dir = tempdir().unwrap();
     let root = dir.path().join("codex");

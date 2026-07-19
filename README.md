@@ -123,7 +123,7 @@ usct <SOURCE> <daily|weekly|monthly|session> [OPTIONS]
 usct blocks [OPTIONS]
 usct claude blocks [OPTIONS]
 usct statusline [OPTIONS]
-usct claude statusline [OPTIONS]
+usct <SOURCE> statusline [OPTIONS]
 
 usct update
 usct sources
@@ -556,13 +556,25 @@ The named-period all-provider aggregate measured **1.721 ms median** and 2.476 m
 
 ## Statusline integration
 
-### Claude hook statusline
+### Hook statusline
 
 The `statusline` command reads hook JSON from standard input. It uses `transcript_path`, calculates current session usage, and adds context utilization when the hook provides `context_window` data:
 
 ```bash
 usct statusline --cost-source both --visual-burn-rate text
+usct omp statusline --cost-source both --visual-burn-rate text
 ```
+
+A source prefix forces the corresponding transcript parser and pricing rules; without one, USCT infers the source from `transcript_path`. If the hook supplies no path, the unprefixed command retains its Claude-compatible fallback.
+
+OMP does not execute Claude's external statusline-command protocol directly. The bundled OMP extension passes the current session path and context percentage to `usct omp statusline`, then renders cost, tokens, context pressure, and burn rate with the active OMP theme.
+
+```bash
+mkdir -p ~/.omp/agent/extensions
+install -m 644 integrations/omp/usct-statusline.ts ~/.omp/agent/extensions/usct-statusline.ts
+```
+
+Run `/reload` or restart OMP after installation. Set `USCT_BIN` if `usct` is not available on OMP's `PATH`.
 
 `--cost-source` selects calculated, host-reported, or combined cost. `--visual-burn-rate` accepts `off`, `text`, `emoji`, or `emoji-text`; threshold options control the low, medium, and high context bands. The one-line result uses a hybrid time-and-file cache, so an append invalidates it even before `--refresh-interval` expires. Use `--no-cache` for an unconditional refresh.
 
