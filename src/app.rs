@@ -46,7 +46,7 @@ pub fn price_record(
         let pricing_id = pricing_id(harness, &item.model);
         let price = catalog
             .find(&pricing_id)
-            .ok_or_else(|| format!("model '{}' is absent from the models.dev cache", item.model))?;
+            .unwrap_or(crate::domain::Price::ZERO);
         let cost_usd = price.cost(item.usage);
         cost += cost_usd;
         models.push(PricedModelUsage {
@@ -107,24 +107,39 @@ pub fn calculate_many(
     })
 }
 
-fn pricing_id(harness: Harness, model: &str) -> String {
-    if model.contains('/') {
-        return model.to_owned();
-    }
-    let provider = if model.starts_with("claude") {
+pub fn pricing_id(harness: Harness, model: &str) -> String {
+    let bare_model = model.rsplit('/').next().unwrap_or(model);
+    let inferred_provider = if bare_model.starts_with("claude") {
         Some("anthropic")
-    } else if model.starts_with("gpt") || model.starts_with('o') {
+    } else if bare_model.starts_with("gpt") || bare_model.starts_with('o') {
         Some("openai")
-    } else if model.starts_with("gemini") {
+    } else if bare_model.starts_with("gemini") {
         Some("google")
     } else {
-        match harness {
-            Harness::Claude => Some("anthropic"),
-            Harness::Codex | Harness::Omp => Some("openai"),
-            Harness::Gemini => Some("google"),
-            Harness::Pi | Harness::OpenCode | Harness::Amp => None,
-        }
+        None
     };
+    if model.contains('/') {
+        return inferred_provider.map_or_else(
+            || model.to_owned(),
+            |provider| format!("{provider}/{bare_model}"),
+        );
+    }
+    let provider = inferred_provider.or(match harness {
+        Harness::Claude => Some("anthropic"),
+        Harness::Codex | Harness::Omp | Harness::Copilot => Some("openai"),
+        Harness::Gemini => Some("google"),
+        Harness::Pi
+        | Harness::OpenCode
+        | Harness::Amp
+        | Harness::Droid
+        | Harness::Codebuff
+        | Harness::Hermes
+        | Harness::Goose
+        | Harness::OpenClaw
+        | Harness::Kilo
+        | Harness::Kimi
+        | Harness::Qwen => None,
+    });
     provider.map_or_else(
         || model.to_owned(),
         |provider| format!("{provider}/{model}"),

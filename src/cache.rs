@@ -14,12 +14,73 @@ use std::{
 };
 
 pub const MODELS_URL: &str = "https://models.dev/api.json";
+const REPORT_CACHE_VERSION: u8 = 10;
+const OUTPUT_CACHE_VERSION: u8 = 2;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
+pub struct DependencyStamp {
+    pub path: PathBuf,
+    length: u64,
+    modified_ns: u128,
+}
+
+impl DependencyStamp {
+    pub fn capture(path: &Path) -> Result<Self, String> {
+        let metadata = fs::metadata(path)
+            .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+        let modified_ns = metadata_modified_ns(&metadata);
+        Ok(Self {
+            path: path.to_path_buf(),
+            length: metadata.len(),
+            modified_ns,
+        })
+    }
+
+    pub(crate) fn is_current(&self) -> bool {
+        fs::metadata(&self.path).is_ok_and(|metadata| {
+            self.length == metadata.len() && self.modified_ns == metadata_modified_ns(&metadata)
+        })
+    }
+}
+
+fn metadata_modified_ns(metadata: &fs::Metadata) -> u128 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |duration| duration.as_nanos())
+}
+
+#[derive(Debug, bincode::Encode, bincode::Decode)]
+struct CachedOutput {
+    version: u8,
+    key: String,
+    dependencies: Vec<DependencyStamp>,
+    output: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct FileFingerprint {
     path: String,
     len: u64,
     mtime_ns: u128,
+}
+
+impl FileFingerprint {
+    fn matches(&self, path: &Path) -> bool {
+        Path::new(&self.path) == path && self.is_current()
+    }
+
+    fn is_current(&self) -> bool {
+        fs::metadata(&self.path).is_ok_and(|metadata| {
+            let modified_ns = metadata
+                .modified()
+                .ok()
+                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_nanos());
+            self.len == metadata.len() && modified_ns == Some(self.mtime_ns)
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,10 +111,8 @@ pub fn load_session(path: &Path, range_key: &str, catalog_path: &Path) -> Option
     let cache_path = session_state_path(catalog_path, path, range_key)?;
     let bytes = fs::read(cache_path).ok()?;
     let session: CachedSession = serde_json::from_slice(&bytes).ok()?;
-    (session.version == 5
-        && session.file == fingerprint(path).ok()?
-        && session.catalog == fingerprint(catalog_path).ok()?)
-    .then_some(session)
+    (session.version == 5 && session.file.matches(path) && session.catalog.matches(catalog_path))
+        .then_some(session)
 }
 
 pub fn save_session(session: &CachedSession, path: &Path, range_key: &str, catalog_path: &Path) {
@@ -132,7 +191,7 @@ impl CachedReport {
             usage,
             cost_usd,
             range,
-            version: 9,
+            version: REPORT_CACHE_VERSION,
             files: contributions
                 .iter()
                 .map(|(_, session)| session.file.clone())
@@ -173,39 +232,99 @@ impl CachedReport {
 
     pub fn reusable_contribution(&self, path: &Path) -> Option<CachedSession> {
         let session = self.contribution(path)?;
-        (session.file == fingerprint(path).ok()?).then_some(session)
+        session.file.matches(path).then_some(session)
     }
 
     pub fn sessions_if_topology_unchanged(&self) -> Option<Vec<(String, PathBuf)>> {
-        (self.directories == refresh(&self.directories).ok()?).then(|| {
-            self.contributions
-                .iter()
-                .map(|contribution| {
-                    (
-                        contribution.source.clone(),
-                        PathBuf::from(&contribution.path),
-                    )
-                })
-                .collect()
-        })
+        self.directories
+            .iter()
+            .all(FileFingerprint::is_current)
+            .then(|| {
+                self.contributions
+                    .iter()
+                    .map(|contribution| {
+                        (
+                            contribution.source.clone(),
+                            PathBuf::from(&contribution.path),
+                        )
+                    })
+                    .collect()
+            })
+    }
+
+    pub fn output_dependencies(&self) -> Vec<DependencyStamp> {
+        self.directories
+            .iter()
+            .chain(&self.files)
+            .chain(std::iter::once(&self.catalog))
+            .map(|fingerprint| DependencyStamp {
+                path: PathBuf::from(&fingerprint.path),
+                length: fingerprint.len,
+                modified_ns: fingerprint.mtime_ns,
+            })
+            .collect()
     }
 }
 
-pub fn load_report(scope: &str, catalog_path: &Path) -> Option<CachedReport> {
+pub fn load_output_entry(
+    namespace: &str,
+    key: &str,
+    catalog_path: &Path,
+) -> Option<(String, Vec<DependencyStamp>)> {
+    let path = output_state_path(catalog_path, namespace, key)?;
+    let bytes = fs::read(path).ok()?;
+    let (cached, consumed): (CachedOutput, _) =
+        bincode::decode_from_slice(&bytes, bincode::config::standard()).ok()?;
+    (consumed == bytes.len()
+        && cached.version == OUTPUT_CACHE_VERSION
+        && cached.key == key
+        && cached.dependencies.iter().all(DependencyStamp::is_current))
+    .then_some((cached.output, cached.dependencies))
+}
+
+pub fn load_output(namespace: &str, key: &str, catalog_path: &Path) -> Option<String> {
+    load_output_entry(namespace, key, catalog_path).map(|(output, _)| output)
+}
+
+pub fn save_output(
+    namespace: &str,
+    key: &str,
+    catalog_path: &Path,
+    dependencies: Vec<DependencyStamp>,
+    output: &str,
+) {
+    let Some(path) = output_state_path(catalog_path, namespace, key) else {
+        return;
+    };
+    let cached = CachedOutput {
+        version: OUTPUT_CACHE_VERSION,
+        key: key.to_owned(),
+        dependencies,
+        output: output.to_owned(),
+    };
+    if let Ok(bytes) = bincode::encode_to_vec(cached, bincode::config::standard()) {
+        write_atomic_bytes(&path, &bytes);
+    }
+}
+
+pub fn load_report_state(scope: &str, catalog_path: &Path) -> Option<(CachedReport, bool)> {
     let path = state_path(catalog_path, scope)?;
     let bytes = fs::read(path).ok()?;
     let report: CachedReport = serde_json::from_slice(&bytes).ok()?;
-    (report.version == 9
-        && report.files == refresh(&report.files).ok()?
-        && report.directories == refresh(&report.directories).ok()?
-        && report.catalog == fingerprint(catalog_path).ok()?)
-    .then_some(report)
+    if report.version != REPORT_CACHE_VERSION || !report.catalog.matches(catalog_path) {
+        return None;
+    }
+    let current = report.files.iter().all(FileFingerprint::is_current)
+        && report.directories.iter().all(FileFingerprint::is_current);
+    Some((report, current))
+}
+
+pub fn load_report(scope: &str, catalog_path: &Path) -> Option<CachedReport> {
+    load_report_state(scope, catalog_path).and_then(|(report, current)| current.then_some(report))
 }
 
 pub fn load_stale_report(scope: &str, catalog_path: &Path) -> Option<CachedReport> {
-    let path = state_path(catalog_path, scope)?;
-    let report: CachedReport = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
-    (report.version == 9 && report.catalog == fingerprint(catalog_path).ok()?).then_some(report)
+    load_report_state(scope, catalog_path).map(|(report, _)| report)
 }
 
 pub fn save_report(report: &CachedReport, scope: &str, catalog_path: &Path) {
@@ -231,13 +350,6 @@ fn fingerprints(paths: &[PathBuf]) -> Result<Vec<FileFingerprint>, String> {
     paths.iter().map(|path| fingerprint(path)).collect()
 }
 
-fn refresh(stored: &[FileFingerprint]) -> Result<Vec<FileFingerprint>, String> {
-    stored
-        .iter()
-        .map(|item| fingerprint(Path::new(&item.path)))
-        .collect()
-}
-
 fn state_path(catalog_path: &Path, scope: &str) -> Option<PathBuf> {
     let mut hasher = DefaultHasher::new();
     scope.hash(&mut hasher);
@@ -245,6 +357,17 @@ fn state_path(catalog_path: &Path, scope: &str) -> Option<PathBuf> {
         catalog_path
             .parent()?
             .join(format!("state-{:016x}.json", hasher.finish())),
+    )
+}
+
+fn output_state_path(catalog_path: &Path, namespace: &str, key: &str) -> Option<PathBuf> {
+    let mut hasher = DefaultHasher::new();
+    namespace.hash(&mut hasher);
+    key.hash(&mut hasher);
+    Some(
+        catalog_path
+            .parent()?
+            .join(format!("output-{:016x}.bin", hasher.finish())),
     )
 }
 
@@ -281,11 +404,15 @@ fn write_atomic(path: &Path, value: &impl Serialize) {
     let Ok(bytes) = serde_json::to_vec(value) else {
         return;
     };
+    write_atomic_bytes(path, &bytes);
+}
+
+fn write_atomic_bytes(path: &Path, bytes: &[u8]) {
     let Some(parent) = path.parent() else { return };
     if fs::create_dir_all(parent).is_err() {
         return;
     }
-    let temporary = parent.join(format!(".session.json.{}.tmp", std::process::id()));
+    let temporary = parent.join(format!(".cache.{}.tmp", std::process::id()));
     if fs::write(&temporary, bytes).is_ok() {
         let _ = fs::rename(&temporary, path);
     } else {

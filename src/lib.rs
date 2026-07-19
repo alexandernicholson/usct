@@ -1,7 +1,10 @@
 pub mod app;
 pub mod cache;
 pub mod catalog;
+pub mod config;
 pub mod discovery;
 pub mod domain;
+pub mod report;
 pub mod session;
+mod table;
 pub mod time_range;

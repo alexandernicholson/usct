@@ -1,6 +1,17 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    bincode::Encode,
+    bincode::Decode,
+)]
 pub struct TokenUsage {
     pub input: u64,
     pub output: u64,
@@ -30,6 +41,14 @@ impl TokenUsage {
 
     pub fn is_empty(self) -> bool {
         self == Self::default()
+    }
+
+    pub fn total_tokens(self) -> u64 {
+        self.input
+            .saturating_add(self.output)
+            .saturating_add(self.cache_read)
+            .saturating_add(self.cache_write)
+            .saturating_add(self.reasoning)
     }
 }
 
@@ -88,6 +107,14 @@ pub struct Price {
 }
 
 impl Price {
+    pub const ZERO: Self = Self {
+        input: 0.0,
+        output: 0.0,
+        cache_read: Some(0.0),
+        cache_write: Some(0.0),
+        reasoning: Some(0.0),
+    };
+
     pub fn cost(self, usage: TokenUsage) -> f64 {
         let million = 1_000_000.0;
         (usage.input as f64 * self.input

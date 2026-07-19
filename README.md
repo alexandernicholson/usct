@@ -13,17 +13,19 @@ No network request occurs while calculating a report. Network access is isolated
 
 ## Features
 
-- Aggregates all local sessions across all available supported providers by default.
-- Restricts aggregation to one harness with `--source`.
-- Prices one transcript with `--session`.
-- Separately accounts for input, output, cache-read, cache-write, and reasoning tokens.
-- Avoids double charging when cached or reasoning tokens are subsets of broader counters.
-- Uses provider-aware model lookup to disambiguate identical model IDs.
-- Reads OpenCode SQLite storage in read-only mode.
-- Maintains aggregate and per-session caches so unchanged transcripts are not reparsed.
-- Detects appended, replaced, added, and removed sessions through file and directory fingerprints.
-- Emits compact statusline output or structured JSON.
-- Atomically refreshes and compacts the models.dev pricing catalog.
+- Keeps a no-subcommand fast path that prints only the aggregate dollar total.
+- Groups usage by day, Monday-starting week, month, session, or configurable billing block.
+- Emits tables, compact tables, one-section JSON, or multi-section JSON from one transcript load.
+- Filters by source, date, timezone, session, Claude project, and Claude instance.
+- Includes per-model and optional per-agent breakdowns, ascending or descending order, and ANSI color controls.
+- Projects active-block usage and token-limit utilization.
+- Produces a cached hook statusline with calculated or host-reported cost and context utilization.
+- Separately accounts for input, output, cache-read, cache-write, and reasoning tokens without double charging subset counters.
+- Uses provider-aware model lookup, local JSON configuration, and optional custom prices.
+- Supports automatic, calculated-only, and per-message reported-cost modes.
+- Maintains aggregate, event-index, parser-progress, and statusline caches with topology and file fingerprint invalidation.
+- Reads JSON, JSONL, and SQLite stores without mutating them.
+- Performs no report-time network requests; only `usct update` downloads the pricing catalog.
 
 ## Supported harnesses
 
@@ -36,6 +38,15 @@ No network request occurs while calculating a report. Network access is isolated
 | OpenCode | `~/.local/share/opencode/` | `OPENCODE_DATA_DIR` |
 | Gemini CLI | `~/.gemini/tmp/*/chats/*.{json,jsonl}` | `GEMINI_DATA_DIR` |
 | Amp | `~/.local/share/amp/threads/**/*.{json,jsonl}` | `AMP_DATA_DIR` |
+| Droid | `~/.factory/sessions/**/*.settings.json` | `DROID_SESSIONS_DIR` |
+| Codebuff | `~/.config/manicode*/projects/**/chat-messages.json` | `CODEBUFF_DATA_DIR` |
+| Hermes | `~/.hermes/**/state.db` | `HERMES_HOME` |
+| Goose | platform Goose data roots containing `sessions.db` | `GOOSE_PATH_ROOT` |
+| OpenClaw | `~/.openclaw/**/*.jsonl` and legacy roots | `OPENCLAW_DIR` |
+| Kilo | `~/.local/share/kilo/**/kilo.db` | `KILO_DATA_DIR` |
+| Kimi | `~/.kimi/**/wire.jsonl`, `~/.kimi-code/**/wire.jsonl` | `KIMI_DATA_DIR` |
+| Qwen | `~/.qwen/projects/*/chats/*.jsonl` | `QWEN_DATA_DIR` |
+| Copilot | `~/.copilot/otel/*.jsonl` | `COPILOT_OTEL_FILE_EXPORTER_PATH` |
 
 Claude Code transcripts under `subagents/` are excluded from automatic discovery to avoid counting delegated work twice when it is already represented in the parent session.
 
@@ -104,15 +115,15 @@ cost="$(usct)"
 ## Usage
 
 ```text
-usct [--source auto|claude|codex|pi|omp|opencode|gemini|amp]
-     [--period all|session|hour|day|week|month|year]
-     [--session PATH]
-     [--format compact|json]
+usct [--source SOURCE] [--period PERIOD] [--session PATH] [--format compact|json]
+usct [--source SOURCE] --from DATE_OR_TIMESTAMP [--to DATE_OR_TIMESTAMP]
 
-usct [--source SOURCE]
-     --from DATE_OR_TIMESTAMP
-     [--to DATE_OR_TIMESTAMP]
-     [--format compact|json]
+usct <daily|weekly|monthly|session> [OPTIONS]
+usct <SOURCE> <daily|weekly|monthly|session> [OPTIONS]
+usct blocks [OPTIONS]
+usct claude blocks [OPTIONS]
+usct statusline [OPTIONS]
+usct claude statusline [OPTIONS]
 
 usct update
 usct sources
@@ -249,6 +260,88 @@ Fields:
 - `tokens.cache_write`: tokens written to a provider cache.
 - `tokens.reasoning`: separately reported reasoning or thought tokens.
 
+### Grouped reports
+
+Grouped commands use event-level accounting while the no-subcommand aggregate retains its smaller fast path:
+
+```bash
+usct daily
+usct weekly --since 2026-07-01 --until 2026-07-18
+usct monthly --timezone America/Los_Angeles
+usct session --json
+usct codex daily --speed fast
+usct claude daily --project my-project --instances
+```
+
+`--since` and `--until` accept `YYYY-MM-DD` or `YYYYMMDD`; both endpoints are inclusive. `--timezone` takes an IANA timezone and controls period boundaries and labels.
+
+Source names can lead a grouped command, as in `usct kimi monthly`. Without a source prefix, all detected sources are included. Useful output controls:
+
+- `--json` or `--format json` emits the stable grouped JSON contract.
+- `--sections daily,weekly,monthly,session` emits several JSON arrays after loading transcripts once.
+- `--no-cost` omits pricing work and cost fields.
+- `--compact` selects the narrow table layout.
+- `--breakdown` adds model rows to tables; JSON always includes `modelBreakdowns`.
+- `--by-agent` adds `agentBreakdowns` to JSON rows.
+- `--order asc|desc` controls period order.
+- `--color` and `--no-color` override terminal color detection.
+- `--mode auto|calculate|display` selects reported or locally calculated event costs.
+- `--single-thread` disables parallel cold parsing; warm event-index reads are unchanged.
+- `--debug --debug-samples N` writes bounded cost-source and price-resolution samples to standard error.
+- `--id`, `--project`, and `--instance` filter transcript paths; `--project-aliases old=new,...` controls displayed Claude instance names.
+
+Each JSON row contains `period`, `agent`, token counters, `totalTokens`, `modelsUsed`, `modelBreakdowns`, and source-specific `metadata`. Priced reports also contain `totalCost`. A top-level `totals` object covers the emitted rows.
+
+### Billing blocks
+
+`blocks` groups Claude usage into rolling five-hour windows by default:
+
+```bash
+usct blocks
+usct blocks --active --token-limit 200000
+usct blocks --recent --order desc --breakdown
+usct blocks --session-length 8 --json
+```
+
+Active rows include end-of-block token and cost projections. `--token-limit max` uses the built-in maximum limit, while a numeric value reports projected utilization.
+
+### Configuration and custom prices
+
+Defaults are loaded from `$XDG_CONFIG_HOME/usct/config.json`, `~/.config/usct/config.json`, or the fallback `~/.usct.json`. `USCT_CONFIG` changes the default path; `--config PATH` selects an explicit file. Command-line options take precedence.
+
+```json
+{
+  "source": "claude",
+  "timezone": "UTC",
+  "format": "json",
+  "sections": ["monthly", "session"],
+  "mode": "auto",
+  "order": "desc",
+  "noCost": false,
+  "compact": false,
+  "byAgent": false,
+  "breakdown": true,
+  "singleThread": false,
+  "sessionLengthHours": 5,
+  "tokenLimit": "200000",
+  "costSource": "reported",
+  "refreshInterval": 1,
+  "cache": true,
+  "prices": {
+    "claude-custom": {
+      "input": 3.0,
+      "output": 15.0,
+      "cache_read": 0.3,
+      "cache_write": 3.75
+    }
+  }
+}
+```
+
+Custom prices are USD per million tokens and allow fully local priced reports even when a model is absent from the catalog.
+
+Shared report defaults include `source`, `timezone`, `format`, `json`, `sections`, `since`, `until`, `order`, `mode`, `compact`, `noCost`, `byAgent`, `breakdown`, `instances`, `sessionId`, `project`, `instance`, `projectAliases`, `speed`, `color`, `noColor`, `debug`, `debugSamples`, and `singleThread`. Billing-block defaults add `active`, `recent`, `tokenLimit`, and `sessionLengthHours`. Statusline defaults add `visualBurnRate`, `costSource`, `refreshInterval`, `contextLowThreshold`, `contextMediumThreshold`, and `cache`. A top-level `$schema` string is accepted for editor integration.
+
 ### Show resolved source roots
 
 ```bash
@@ -295,6 +388,16 @@ USCT_MODELS_PATH=/path/to/models.json usct
 The ordinary reporting path is offline. If the catalog is absent or invalid, USCT exits nonzero and instructs you to run `usct update`.
 
 ## Cost calculation
+
+### Cost source modes
+
+Grouped reports and billing blocks accept `--mode`:
+
+- `auto` uses a nonnegative per-message reported cost when the source supplies one, otherwise it calculates from token counts and local prices.
+- `calculate` ignores reported costs and always applies configured or catalog prices.
+- `display` uses only per-message reported costs; events without one contribute zero cost and do not require a pricing catalog.
+
+`--no-cost` skips both reported-cost aggregation and pricing work.
 
 models.dev prices are denominated in USD per one million tokens. USCT calculates:
 
@@ -350,10 +453,13 @@ Likewise, a model revision ending in a valid `YYYY-MM-DD` date uses the correspo
 
 ## Cache behavior
 
-USCT maintains two cache layers beside `models.json`:
+USCT maintains five cache forms beside `models.json`:
 
-1. **Per-session reports** store normalized per-model usage, resolved prices, and the calculated cost for an unchanged transcript.
-2. **Scope aggregates** store the rendered inputs for scopes such as all providers, one source, or an explicit session.
+1. **Parser progress and per-session reports** retain normalized usage, resolved prices, and append-only JSONL state.
+2. **Scope aggregates** retain all-provider, one-source, named-period, and explicit-session totals.
+3. **Binary event indexes** retain timestamped per-file usage and per-message reported costs for grouped and billing-block reports.
+4. **Binary report caches** retain dependency-validated grouped data and rendered output, so repeated formats return without rebuilding reports.
+5. **Statusline state** retains one rendered hook result for its configured refresh interval.
 
 Cache validation includes:
 
@@ -392,64 +498,73 @@ Plain JSON and SQLite stores retain the safe full-parser fallback because they d
 
 ## Performance
 
-Measurements were taken on macOS arm64 against the optimized release binary. Warm commands use 200 separate process invocations. Full-rebuild and incremental-append measurements use isolated temporary session and catalog paths so an existing cache cannot turn a rebuild into a cache hit.
+Measurements were taken on macOS arm64 against the optimized release binary with Hyperfine 1.20. Warm commands use `--shell=none --warmup 20 --runs 200`; medians and p95 values are calculated from Hyperfine's exported per-run timings. Forced full rebuilds use 50 isolated temporary session and catalog paths per provider so an existing cache cannot turn a rebuild into a cache hit.
+
+The repository includes a hermetic benchmark suite:
+
+```bash
+benches/hyperfine.sh
+```
+
+It benchmarks the bare dollar total, named-period aggregate, help, daily table and JSON reports, four-section JSON, billing blocks, and cached statusline. Every measured command uses `--shell=none`; Hyperfine supplies statusline stdin with `--input`.
+
+Set `USCT_BASELINE_BIN` to compare the bare command against another binary. The script fails when the candidate median exceeds the baseline by more than 5% by default:
+
+```bash
+USCT_BASELINE_BIN=/path/to/baseline benches/hyperfine.sh
+```
+
+`USCT_BENCH_BIN`, `USCT_BENCH_WARMUP`, `USCT_BENCH_RUNS`, and `USCT_MAX_REGRESSION` control the candidate, sample counts, and regression ceiling.
 
 ### Standalone process floor
 
 | Command | Runs | Median | p95 |
 |---|---:|---:|---:|
-| `/usr/bin/true` | 200 | 1.491 ms | 2.133 ms |
-| `usct --help` | 200 | 2.907 ms | 3.275 ms |
+| `/usr/bin/true` | 200 | 0.862 ms | 1.121 ms |
+| `usct --help` | 200 | 1.473 ms | 1.757 ms |
 
-Darwin process creation consumes most of a warm USCT invocation. The CLI's application work is approximately 1.4 ms above the measured `/usr/bin/true` median.
+Darwin process creation consumes most of a warm USCT invocation. The no-subcommand path does not initialize timezone grouping; grouped commands resolve the system IANA timezone only when `--timezone` is omitted.
 
 ### Warm reports
 
 | Command | Runs | Median | p95 |
 |---|---:|---:|---:|
-| `usct --period day` | 200 | 2.920 ms | 3.255 ms |
-| `usct --source omp --period day` | 200 | 2.981 ms | 3.495 ms |
-| `usct --source omp --session <active.jsonl>` | 200 | 3.095 ms | 3.582 ms |
+| `usct --period day` | 200 | **1.721 ms** | 2.476 ms |
+| `usct --source omp --period day` | 200 | 1.758 ms | 2.201 ms |
+| `usct --source omp --session <active.jsonl>` | 200 | 1.567 ms | 2.039 ms |
 
 These paths load a valid aggregate or session contribution and do not reparse transcript history.
 
-### Uncached small session
-
-Each of 50 runs used a new temporary catalog path and session path, forcing catalog decoding, session parsing, pricing, and an atomic cache write.
-
-| Runs | Median | p95 | Minimum | Maximum |
-|---:|---:|---:|---:|---:|
-| 50 | 5.086 ms | 7.184 ms | 4.617 ms | 12.314 ms |
-
 ### Forced full rebuilds
 
-Each benchmark uses a frozen copy of the largest local transcript available for that provider. Every invocation receives a new temporary transcript and catalog path, forcing transcript parsing, models.dev decoding, pricing, and an atomic cache write.
+Each benchmark uses the largest local transcript available for that provider at measurement time. Before every invocation Hyperfine copies the transcript and catalog into a fresh temporary cache root, forcing transcript parsing, models.dev decoding, pricing, and an atomic cache write.
 
 | Provider | Bytes | Records | Runs | Median | p95 | Minimum | Maximum |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| OMP | 7,786,869 | 1,605 | 100 | **9.995 ms** | 10.778 ms | 9.371 ms | 10.978 ms |
-| Claude Code | 7,077,632 | 2,667 | 100 | **9.619 ms** | 10.044 ms | 9.364 ms | 10.847 ms |
-| Codex CLI | 599,348 | 168 | 100 | **5.333 ms** | 5.627 ms | 5.024 ms | 6.108 ms |
+| OMP | 44,768,149 | 7,785 | 50 | **33.430 ms** | 37.240 ms | 31.172 ms | 40.156 ms |
+| Claude Code | 8,057,560 | 3,031 | 50 | **12.739 ms** | 13.771 ms | 10.837 ms | 15.234 ms |
+| Codex CLI | 10,859,972 | 5,609 | 50 | **14.044 ms** | 15.277 ms | 12.375 ms | 16.524 ms |
 
 Borrowed provider envelopes extract only accounting fields and ask Serde to skip `content`, tool arguments, tool results, generated text, and unrelated metadata instead of constructing a recursive `serde_json::Value` tree for every known record.
 
 Claude preserves exact message-ID deduplication. Codex preserves cumulative token snapshots, pre-range baselines, cached-input normalization, and reasoning-token separation. OMP preserves nested `message.details.response.usage` accounting. Unknown record types containing usage fields fall back to recursive `Value` traversal for schema compatibility.
 
-### Incremental OMP append
-
-The controlled append benchmark first seeds the 7,786,869-byte OMP transcript, then appends one complete usage record per isolated run.
-
-| Runs | Median | p95 | Minimum | Maximum |
-|---:|---:|---:|---:|---:|
-| 100 | **3.699 ms** | 4.163 ms | 3.218 ms | 10.732 ms |
-
-The one-time full rebuild is required after installation, cache-schema changes, replacement, or truncation. Normal append-only updates seek to the stored byte offset and decode only newly completed records. Plain JSON and SQLite sources retain their safe full-parser fallback.
 
 ### Live aggregate state
 
-The daily all-provider command measured 2.920 ms median and 3.255 ms p95 over 200 warm invocations. Its aggregate state retains normalized contributions, resolved prices, transcript fingerprints, directory topology, and parser progress. A normal append avoids recursive discovery, unchanged session reads, and models.dev decoding, then performs one atomic aggregate-state write.
+The named-period all-provider aggregate measured **1.721 ms median** and 2.476 ms p95 over 200 warm invocations. Its aggregate state retains normalized contributions, resolved prices, transcript fingerprints, directory topology, and parser progress. A normal append avoids recursive discovery, unchanged session reads, and models.dev decoding, then performs one atomic aggregate-state write.
 
 ## Statusline integration
+
+### Claude hook statusline
+
+The `statusline` command reads hook JSON from standard input. It uses `transcript_path`, calculates current session usage, and adds context utilization when the hook provides `context_window` data:
+
+```bash
+usct statusline --cost-source both --visual-burn-rate text
+```
+
+`--cost-source` selects calculated, host-reported, or combined cost. `--visual-burn-rate` accepts `off`, `text`, `emoji`, or `emoji-text`; threshold options control the low, medium, and high context bands. The one-line result uses a hybrid time-and-file cache, so an append invalidates it even before `--refresh-interval` expires. Use `--no-cache` for an unconditional refresh.
 
 ### Starship
 
@@ -498,6 +613,17 @@ Frequent command substitution still pays the operating system's process-launch c
 | `OPENCODE_DATA_DIR` | Override OpenCode's data directory. |
 | `GEMINI_DATA_DIR` | Override Gemini CLI's data directory. |
 | `AMP_DATA_DIR` | Override Amp's data directory. |
+| `DROID_SESSIONS_DIR` | Override Droid's sessions directory. |
+| `CODEBUFF_DATA_DIR` | Override one or more Codebuff data roots. |
+| `HERMES_HOME` | Override one or more Hermes roots. |
+| `GOOSE_PATH_ROOT` | Override one or more Goose data roots. |
+| `OPENCLAW_DIR` | Override one or more OpenClaw roots. |
+| `KILO_DATA_DIR` | Override one or more Kilo data roots. |
+| `KIMI_DATA_DIR` | Override one or more Kimi roots. |
+| `QWEN_DATA_DIR` | Override one or more Qwen roots. |
+| `COPILOT_OTEL_FILE_EXPORTER_PATH` | Add an explicit Copilot OTEL JSONL path. |
+| `USCT_CONFIG` | Override the default JSON configuration path. |
+| `FORCE_COLOR` / `NO_COLOR` | Force or disable ANSI table color. |
 
 Path-list overrides use the platform's normal path-list separator.
 
@@ -514,7 +640,7 @@ usct: no supported coding-agent session found
 Common errors include:
 
 - pricing cache missing or malformed;
-- no sessions found for a selected source;
+- no sessions found for a selected fast aggregate scope (grouped reports instead return empty rows and zero totals);
 - a transcript containing no usable model identifier;
 - a model absent from the pricing catalog;
 - malformed JSON or an unreadable SQLite database;
@@ -565,30 +691,33 @@ If development is occurring inside a supported coding harness, that harness is a
 ```text
 CLI and rendering
        │
-       ▼
-Application aggregation
+       ├── compact aggregate path
+       │      ├── incremental session parsers
+       │      └── aggregate/session caches
        │
-       ├── session discovery
-       ├── source-specific parsing
-       ├── models.dev pricing lookup
-       └── report/session caches
-                │
-                ▼
-        token and pricing domain
+       └── event report path
+              ├── source adapters and event indexes
+              ├── timezone grouping and filters
+              └── tables, JSON, blocks, statusline
+                         │
+                         ▼
+                token and pricing domain
 ```
 
 Source layout:
 
 | Path | Responsibility |
 |---|---|
-| `src/main.rs` | CLI parsing, scope selection, cached aggregation, and rendering. |
+| `src/main.rs` | CLI routing, option layering, aggregate rendering, and hook statusline. |
 | `src/app.rs` | Provider-aware session pricing and aggregate domain operations. |
 | `src/domain.rs` | Token usage, model price, and cost arithmetic. |
 | `src/catalog.rs` | models.dev parsing, compaction, and lookup. |
+| `src/config.rs` | JSON configuration discovery and decoding. |
 | `src/discovery.rs` | Source roots, candidate filtering, and session discovery. |
-| `src/session.rs` | Claude, Codex, Pi, OMP, OpenCode, Gemini, and Amp parsing. |
-| `src/cache.rs` | Pricing updates, fingerprints, per-session caches, and aggregate caches. |
-| `tests/contracts.rs` | Behavioral and CLI contract tests. |
+| `src/session.rs` | JSON, JSONL, OTEL, and source-specific SQLite normalization. |
+| `src/report.rs` | Event indexes, grouping, JSON/table output, and billing blocks. |
+| `src/cache.rs` | Pricing updates, fingerprints, parser progress, and aggregate caches. |
+| `tests/contracts.rs` | Behavioral, adapter, cache, and CLI contract tests. |
 
 The domain layer does not perform filesystem, network, CLI, or rendering work. Source adapters normalize external formats into the same `TokenUsage` representation.
 
@@ -620,16 +749,16 @@ cargo build --release
 
 The test suite covers:
 
-- independent token-class arithmetic;
-- cached and reasoning subset normalization;
-- models.dev lookup;
-- source-aware provider disambiguation;
-- Claude message deduplication;
-- Codex cumulative snapshots;
-- OMP equal-usage message handling;
-- generic Pi, OpenCode, Gemini, and Amp usage objects;
-- cross-provider aggregation;
-- explicit-session CLI output.
+- independent token-class arithmetic and subset normalization;
+- models.dev lookup and source-aware provider disambiguation;
+- Claude message deduplication and Codex cumulative snapshots;
+- OMP equal-usage messages and generic schema fallback;
+- native JSON adapters and structured SQLite adapters;
+- timezone/date grouping, inclusive filters, and multi-section JSON;
+- grouped event-cache append invalidation;
+- offline custom pricing and Codex fast-tier pricing;
+- hook statusline options;
+- cross-provider aggregate and explicit-session output.
 
 ## Data and privacy
 
