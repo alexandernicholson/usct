@@ -2,6 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { truncateToWidth } from "@oh-my-pi/pi-tui";
 
 const USCT_BIN = process.env.USCT_BIN || "usct";
+const ZERO_STATUS = "$0.00 · 0";
 
 function contextPercent(ctx: ExtensionContext): number | undefined {
   const tokens = ctx.getContextUsage()?.tokens;
@@ -51,8 +52,8 @@ async function refreshStatus(ctx: ExtensionContext): Promise<void> {
   if (!ctx.hasUI) return;
 
   const transcriptPath = ctx.sessionManager.getSessionFile();
-  if (!transcriptPath) {
-    displayStatus(ctx, "");
+  if (!transcriptPath || !(await Bun.file(transcriptPath).exists())) {
+    displayStatus(ctx, ZERO_STATUS);
     return;
   }
 
@@ -86,7 +87,7 @@ async function refreshStatus(ctx: ExtensionContext): Promise<void> {
     const detail = stderr.trim().replace(/^usct:\s*/, "");
     let text = stdout.trim();
     if (exitCode !== 0) {
-      text = detail === "session contains no token usage" ? "" : `usct: ${detail || `exit ${exitCode}`}`;
+      text = detail === "session contains no token usage" ? ZERO_STATUS : `usct: ${detail || `exit ${exitCode}`}`;
     }
     displayStatus(ctx, text);
   } catch (error) {
